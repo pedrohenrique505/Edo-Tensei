@@ -1,0 +1,109 @@
+cmake_minimum_required(VERSION 3.21)
+
+# Build nativo de Naruto Shippuden: Ultimate Ninja 5 (SLES_556.05, PAL v1.00).
+#
+# Usa o runtime do PS2Recomp (external/PS2Recomp) como biblioteca e compila o
+# código gerado (generated/) em targets separados, para iterar rápido:
+#   edo_generated   funções recompiladas (unity build + PCH, -O2)
+#   edo-tensei      executável: tabela de funções (-O0), overrides e main
+
+project(EdoTenseiRecomp LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+set(PS2RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/PS2Recomp" CACHE PATH "Clone do PS2Recomp")
+set(EDO_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/generated" CACHE PATH "Saída do ps2_recomp")
+set(EDO_UNITY_BATCH 32 CACHE STRING "Funções por TU no unity build do código gerado")
+
+if(NOT EXISTS "${PS2RECOMP_DIR}/ps2xRuntime/CMakeLists.txt")
+    message(FATAL_ERROR "PS2Recomp não encontrado em ${PS2RECOMP_DIR}")
+endif()
+if(NOT EXISTS "${EDO_GENERATED_DIR}/register_functions.cpp")
+    message(FATAL_ERROR "Código gerado não encontrado em ${EDO_GENERATED_DIR}: rode o ps2_recomp antes")
+endif()
+
+# GCC/Clang no x86-64 precisam habilitar SSE4.1/AVX2 explicitamente (PS2Recomp#261).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT MSVC)
+    add_compile_options(-march=x86-64-v3)
+endif()
+
+option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" OFF)
+set(PS2X_IS_ARM_TARGET OFF)
+add_subdirectory("${PS2RECOMP_DIR}/ps2xIOP" ps2xIOP EXCLUDE_FROM_ALL)
+add_subdirectory("${PS2RECOMP_DIR}/ps2xRuntime" ps2xRuntime EXCLUDE_FROM_ALL)
+
+set(RT_DIR "${PS2RECOMP_DIR}/ps2xRuntime")
+
+# ---------------------------------------------------------------------------
+# Código recompilado (sem register_functions.cpp)
+# ---------------------------------------------------------------------------
+file(GLOB EDO_GENERATED_SOURCES "${EDO_GENERATED_DIR}/*.cpp")
+list(REMOVE_ITEM EDO_GENERATED_SOURCES
+    "${EDO_GENERATED_DIR}/register_functions.cpp"
+    "${EDO_GENERATED_DIR}/vu1_recompiled.cpp"
+)
+list(SORT EDO_GENERATED_SOURCES)
+
+add_library(edo_generated STATIC ${EDO_GENERATED_SOURCES})
+target_include_directories(edo_generated PUBLIC "${EDO_GENERATED_DIR}")
+target_link_libraries(edo_generated PUBLIC ps2_runtime)
+set_target_properties(edo_generated PROPERTIES
+    UNITY_BUILD ON
+    UNITY_BUILD_BATCH_SIZE "${EDO_UNITY_BATCH}"
+)
+target_precompile_headers(edo_generated PRIVATE
+    "${RT_DIR}/include/ps2_runtime_macros.h"
+    "${RT_DIR}/include/ps2_runtime.h"
+    "${EDO_GENERATED_DIR}/ps2_recompiled_functions.h"
+    "${EDO_GENERATED_DIR}/ps2_recompiled_stubs.h"
+    "${RT_DIR}/include/ps2_syscalls.h"
+    "${RT_DIR}/include/ps2_stubs.h"
+)
+
+# ---------------------------------------------------------------------------
+# Executável
+# ---------------------------------------------------------------------------
+file(GLOB EDO_OVERRIDE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/overrides/*.cpp")
+
+add_executable(edo-tensei
+    "${RT_DIR}/src/main.cpp"
+    "${EDO_GENERATED_DIR}/register_functions.cpp"
+    ${EDO_OVERRIDE_SOURCES}
+)
+target_link_libraries(edo-tensei PRIVATE ps2_runtime edo_generated)
+target_include_directories(edo-tensei PRIVATE "${RT_DIR}/src/lib")
+
+# A tabela de funções é um construtor grande; -O0 evita minutos de compilação.
+set_source_files_properties("${EDO_GENERATED_DIR}/register_functions.cpp"
+    PROPERTIES COMPILE_OPTIONS "-O0")
+
+# paraLLEl-GS (Vulkan) para apresentação em GPU com FPS jogável.
+option(EDO_ENABLE_PARALLEL_GS "Ativar sink Vulkan paraLLEl-GS (EDO_GS_BACKEND=gpu-present)" ON)
+if(EDO_ENABLE_PARALLEL_GS)
+    set(EDO_PARALLEL_GS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/.cache/parallel-gs-source"
+        CACHE PATH "Checkout pinado do paraLLEl-GS")
+    if(NOT EXISTS "${EDO_PARALLEL_GS_SOURCE}/gs/gs_interface.hpp")
+        message(FATAL_ERROR "paraLLEl-GS não encontrado em ${EDO_PARALLEL_GS_SOURCE}")
+    endif()
+    set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
+    set(GRANITE_AUDIO OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${EDO_PARALLEL_GS_SOURCE}" parallel-gs EXCLUDE_FROM_ALL)
+    target_sources(edo-tensei PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/parallel_gs/edo_parallel_gs.cpp")
+    target_include_directories(edo-tensei PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/parallel_gs")
+    target_link_libraries(edo-tensei PRIVATE parallel-gs)
+    target_compile_definitions(edo-tensei PRIVATE EDO_HAS_PARALLEL_GS=1)
+endif()
+
+if(PS2X_ENABLE_DEBUG_UI)
+    target_sources(edo-tensei PRIVATE "${RT_DIR}/src/lib/ps2_debug_panel.cpp")
+    target_link_libraries(edo-tensei PRIVATE rlImGui imgui)
+    target_compile_definitions(edo-tensei PRIVATE PS2X_ENABLE_DEBUG_UI=1)
+endif()
+
+if(EXISTS "${EDO_GENERATED_DIR}/vu1_recompiled.cpp")
+    set_source_files_properties("${EDO_GENERATED_DIR}/vu1_recompiled.cpp"
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    target_sources(edo-tensei PRIVATE "${EDO_GENERATED_DIR}/vu1_recompiled.cpp")
+endif()
