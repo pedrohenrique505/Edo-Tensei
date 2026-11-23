@@ -18,7 +18,7 @@ import ghidra.program.model.mem.MemoryBlock;
 
 public class CreateGapFunctions extends GhidraScript {
     private static final int JR_RA = 0x03E00008;
-    private static final long CODE_END_LIMIT = 0x00413000L;
+    private static final long CODE_END_LIMIT = 0x003D5700L;
 
     @Override
     public void run() throws Exception {
