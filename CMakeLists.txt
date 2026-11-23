@@ -90,6 +90,21 @@ add_executable(edo-tensei
 target_link_libraries(edo-tensei PRIVATE ps2_runtime edo_generated)
 target_include_directories(edo-tensei PRIVATE "${RT_DIR}/src/lib")
 
+# Construtores estáticos C++ (.ctors em 0x005E3A00..0x005E6840), gerados separadamente
+# para não precisar recompilar edo_generated inteiro.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated_ctors/register_ctors.cpp")
+    file(GLOB EDO_CTOR_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/generated_ctors/*.cpp")
+    add_library(edo_ctors STATIC ${EDO_CTOR_SOURCES})
+    target_include_directories(edo_ctors PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/generated_ctors"
+        "${EDO_GENERATED_DIR}"
+    )
+    target_link_libraries(edo_ctors PUBLIC ps2_runtime)
+    set_target_properties(edo_ctors PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 64)
+    target_link_libraries(edo-tensei PRIVATE edo_ctors)
+    target_compile_definitions(edo-tensei PRIVATE EDO_HAS_CTORS=1)
+endif()
+
 # A tabela de funções é um construtor grande; -O0 evita minutos de compilação.
 set_source_files_properties("${EDO_GENERATED_DIR}/register_functions.cpp"
     PROPERTIES COMPILE_OPTIONS "-O0")

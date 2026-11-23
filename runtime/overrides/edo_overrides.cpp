@@ -23,6 +23,10 @@
 #include <string_view>
 #include <unordered_map>
 
+#ifdef EDO_HAS_CTORS
+extern void edoRegisterCtorFunctions(PS2Runtime &runtime);
+#endif
+
 namespace
 {
     constexpr uint32_t kEntry = 0x00100008u;
@@ -179,6 +183,9 @@ namespace
 
     void apply(PS2Runtime &runtime)
     {
+#ifdef EDO_HAS_CTORS
+        ::edoRegisterCtorFunctions(runtime);
+#endif
 #ifdef EDO_HAS_PARALLEL_GS
         edo_parallel_gs::installIfRequested(runtime);
 #endif
