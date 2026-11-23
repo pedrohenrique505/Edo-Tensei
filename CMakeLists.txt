@@ -53,6 +53,21 @@ set_target_properties(edo_generated PROPERTIES
     UNITY_BUILD ON
     UNITY_BUILD_BATCH_SIZE "${EDO_UNITY_BATCH}"
 )
+# Funções geradas gigantes (>4 MB cada) explodem o tempo do otimizador em -O2.
+foreach(_big_fn
+    FUN_00130560_0x130560.cpp
+    FUN_00133ec8_0x133ec8.cpp
+    FUN_00133ee0_0x133ee0.cpp
+    FUN_00134080_0x134080.cpp
+    FUN_00134068_0x134068.cpp
+)
+    if(EXISTS "${EDO_GENERATED_DIR}/${_big_fn}")
+        set_source_files_properties("${EDO_GENERATED_DIR}/${_big_fn}" PROPERTIES
+            SKIP_UNITY_BUILD_INCLUSION ON
+            COMPILE_OPTIONS "-O0"
+        )
+    endif()
+endforeach()
 target_precompile_headers(edo_generated PRIVATE
     "${RT_DIR}/include/ps2_runtime_macros.h"
     "${RT_DIR}/include/ps2_runtime.h"
