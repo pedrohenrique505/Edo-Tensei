@@ -105,6 +105,51 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated_ctors/register_ctors.cpp")
     target_compile_definitions(edo-tensei PRIVATE EDO_HAS_CTORS=1)
 endif()
 
+# Overlays dinâmicos (PRG/BTL.BIN, PRG/ADV.BIN, PRG/ETC.BIN em 0x006C6D00).
+# Cada overlay é compilado em sua própria biblioteca estática com símbolos prefixados
+# e tabela de registro própria (register_ovl_<nome>.cpp) para troca dinâmica em runtime.
+foreach(_ovl btl adv etc)
+    set(_ovl_dir "${CMAKE_CURRENT_SOURCE_DIR}/generated_ovl_${_ovl}")
+    set(_ovl_reg "${_ovl_dir}/register_ovl_${_ovl}.cpp")
+    if(EXISTS "${_ovl_reg}")
+        file(GLOB _ovl_sources "${_ovl_dir}/*.cpp")
+        list(REMOVE_ITEM _ovl_sources "${_ovl_reg}")
+        list(SORT _ovl_sources)
+        add_library(edo_ovl_${_ovl} STATIC ${_ovl_sources} "${_ovl_reg}")
+        target_include_directories(edo_ovl_${_ovl} PRIVATE "${_ovl_dir}")
+        target_link_libraries(edo_ovl_${_ovl} PUBLIC ps2_runtime)
+        set_target_properties(edo_ovl_${_ovl} PROPERTIES
+            UNITY_BUILD ON
+            UNITY_BUILD_BATCH_SIZE "${EDO_UNITY_BATCH}"
+        )
+        set_source_files_properties("${_ovl_reg}" PROPERTIES
+            SKIP_UNITY_BUILD_INCLUSION ON
+            COMPILE_OPTIONS "-O0"
+        )
+        # Funções geradas gigantes (>1.5 MB) explodem o otimizador em -O2.
+        foreach(_src ${_ovl_sources})
+            file(SIZE "${_src}" _src_size)
+            if(_src_size GREATER 1500000)
+                set_source_files_properties("${_src}" PROPERTIES
+                    SKIP_UNITY_BUILD_INCLUSION ON
+                    COMPILE_OPTIONS "-O0"
+                )
+            endif()
+        endforeach()
+        target_precompile_headers(edo_ovl_${_ovl} PRIVATE
+            "${RT_DIR}/include/ps2_runtime_macros.h"
+            "${RT_DIR}/include/ps2_runtime.h"
+            "${_ovl_dir}/ps2_recompiled_functions.h"
+            "${_ovl_dir}/ps2_recompiled_stubs.h"
+            "${RT_DIR}/include/ps2_syscalls.h"
+            "${RT_DIR}/include/ps2_stubs.h"
+        )
+        string(TOUPPER "${_ovl}" _ovl_up)
+        target_link_libraries(edo-tensei PRIVATE edo_ovl_${_ovl})
+        target_compile_definitions(edo-tensei PRIVATE "EDO_HAS_OVL_${_ovl_up}=1")
+    endif()
+endforeach()
+
 # A tabela de funções é um construtor grande; -O0 evita minutos de compilação.
 set_source_files_properties("${EDO_GENERATED_DIR}/register_functions.cpp"
     PROPERTIES COMPILE_OPTIONS "-O0")
