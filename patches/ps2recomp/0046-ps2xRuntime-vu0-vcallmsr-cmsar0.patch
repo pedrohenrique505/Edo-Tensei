@@ -1,0 +1,57 @@
+From: Edo-Tensei <edo-tensei@local>
+Subject: [PATCH] ps2xRuntime/ps2xRecomp: use ctx->vu0_cmsar0 in VCALLMSR / vu0StartMicroProgram
+
+`ctc2 $rt, $vi27` stores the VU0 microprogram start address in `ctx->vu0_cmsar0`,
+while `translateVU_VCALLMSR` previously read `ctx->vi[27]` (which stays 0).
+Fix both the recompiler helper and `PS2Runtime::vu0StartMicroProgram` so
+already-generated callers also jump to `(ctx->vu0_cmsar0 & 0x1FF) << 3`.
+---
+ ps2xRecomp/src/lib/vu_translation_helpers.cpp | 19 ++++++++-----------
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |  7 ++++++-
+ 2 files changed, 14 insertions(+), 12 deletions(-)
+
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -164,17 +164,14 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VCALLMSR(const Instruction &inst)
+     {
+-        // VCALLMSR calls a VU0 microprogram at address stored in integer register
+-        uint8_t vis_reg_idx = inst.rd; // Source integer register (vis)
+-
+-        return fmt::format(
+-            "{{ "
+-            "    uint16_t instr_index = ctx->vi[{}] & 0x1FF; "             // Get instruction index from VI[IS], mask to 9 bits
+-            "    uint32_t target_byte_addr = (uint32_t)instr_index << 3; " // Convert to byte address
+-            "    ctx->vu0_pc = target_byte_addr; "
+-            "    runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); "
+-            "}}",
+-            vis_reg_idx);
++        // VCALLMSR calls a VU0 microprogram at the address in CMSAR0 ($vi27 / ctx->vu0_cmsar0).
++        (void)inst;
++        return "{ "
++               "    uint16_t instr_index = ctx->vu0_cmsar0 & 0x1FF; "
++               "    uint32_t target_byte_addr = (uint32_t)instr_index << 3; "
++               "    ctx->vu0_pc = target_byte_addr; "
++               "    runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); "
++               "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1512,7 +1512,12 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32
+ void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
+ {
+-    // VCALLMS and VCALLMSR both route here.
++    // VCALLMSR jumps to CMSAR0 (vi27), which ctc2 writes to ctx->vu0_cmsar0 rather than ctx->vi[27].
++    if (address == 0u && ctx && (ctx->vu0_cmsar0 & 0x1FFu) != 0u)
++    {
++        address = (ctx->vu0_cmsar0 & 0x1FFu) << 3;
++        ctx->vu0_pc = address;
++    }
+     executeVU0Microprogram(rdram, ctx, address);
+ }
+ 
