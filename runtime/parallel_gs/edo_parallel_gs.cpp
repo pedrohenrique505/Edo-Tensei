@@ -576,8 +576,13 @@ public:
             return;
         }
         const uint32_t w = slot.width, h = slot.height;
-        const uint32_t targetW = (slot.internalWidth && slot.internalWidth < w)
-                                     ? slot.internalWidth : w;
+        uint32_t targetW = (slot.internalWidth && slot.internalWidth < w)
+                               ? slot.internalWidth : w;
+        if (targetW > 640u)
+        {
+            const uint32_t div = (w + 639u) / 640u;
+            targetW = (div > 0u) ? (w / div) : 640u;
+        }
         const bool isFirst = (m_stats.presentedFrames == 0);
         uint64_t rgbSum = 0;
         uint32_t outW = w;
