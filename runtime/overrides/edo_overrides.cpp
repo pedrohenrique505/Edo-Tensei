@@ -24,6 +24,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -32,6 +33,22 @@
 
 #ifdef EDO_HAS_CTORS
 extern void edoRegisterCtorFunctions(PS2Runtime &runtime);
+#endif
+
+struct EdoOverlayEntry
+{
+    uint32_t address;
+    PS2Runtime::RecompiledFunction fn;
+};
+
+#ifdef EDO_HAS_OVL_BTL
+extern const EdoOverlayEntry *edoOverlayEntries_btl(size_t *outCount);
+#endif
+#ifdef EDO_HAS_OVL_ADV
+extern const EdoOverlayEntry *edoOverlayEntries_adv(size_t *outCount);
+#endif
+#ifdef EDO_HAS_OVL_ETC
+extern const EdoOverlayEntry *edoOverlayEntries_etc(size_t *outCount);
 #endif
 
 namespace
@@ -246,6 +263,101 @@ namespace
         ctx->pc = getRegU32(ctx, 31);
     }
 
+    // 0x00100270: ativacao de overlay MWo3 chamada por FUN_001c3150(slot, filename).
+    // Troca os entrypoints do overlay ativo na g_sparseFunctionTable ANTES de
+    // FUN_00100270 zerar o .bss e executar os construtores estaticos (.ctors) via FUN_0011a0b0.
+    void activateOverlay(PS2Runtime *runtime, uint32_t overlayId, const char *name, uint32_t base, uint32_t size)
+    {
+        static std::mutex mu;
+        static uint32_t activeId = 0;
+        static const EdoOverlayEntry *activeEntries = nullptr;
+        static size_t activeCount = 0;
+
+        std::lock_guard<std::mutex> lock(mu);
+        if (activeId == overlayId && activeEntries != nullptr)
+        {
+            return;
+        }
+
+        const EdoOverlayEntry *nextEntries = nullptr;
+        size_t nextCount = 0;
+        switch (overlayId)
+        {
+#ifdef EDO_HAS_OVL_BTL
+        case 1u:
+            nextEntries = ::edoOverlayEntries_btl(&nextCount);
+            break;
+#endif
+#ifdef EDO_HAS_OVL_ADV
+        case 2u:
+            nextEntries = ::edoOverlayEntries_adv(&nextCount);
+            break;
+#endif
+#ifdef EDO_HAS_OVL_ETC
+        case 3u:
+            nextEntries = ::edoOverlayEntries_etc(&nextCount);
+            break;
+#endif
+        default:
+            break;
+        }
+
+        if (activeEntries != nullptr)
+        {
+            for (size_t i = 0; i < activeCount; ++i)
+            {
+                runtime->replaceFunction(activeEntries[i].address, nullptr);
+            }
+            activeEntries = nullptr;
+            activeCount = 0;
+            activeId = 0;
+        }
+
+        if (nextEntries != nullptr && nextCount > 0)
+        {
+            for (size_t i = 0; i < nextCount; ++i)
+            {
+                runtime->registerFunction(nextEntries[i].address, nextEntries[i].fn);
+            }
+            activeEntries = nextEntries;
+            activeCount = nextCount;
+            activeId = overlayId;
+            std::fprintf(stderr, "[edo:ovl] ativo id=%u (%s) base=0x%08X size=0x%X (%zu entrypoints)\n",
+                         overlayId, name ? name : "?", base, size, nextCount);
+            std::fflush(stderr);
+        }
+        else
+        {
+            std::fprintf(stderr, "[edo:ovl] AVISO: overlay id=%u (%s) nao recompilado (base=0x%08X size=0x%X)\n",
+                         overlayId, name ? name : "?", base, size);
+            std::fflush(stderr);
+        }
+    }
+
+    void overlayActivateHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == 0x00100270u && runtime != nullptr)
+        {
+            const uint32_t base = getRegU32(ctx, 4);
+            const uint32_t size = getRegU32(ctx, 5);
+            const uint8_t *hdr = getConstMemPtr(rdram, base);
+            if (hdr != nullptr)
+            {
+                uint32_t magic = 0;
+                uint32_t overlayId = 0;
+                std::memcpy(&magic, hdr + 0, 4);
+                std::memcpy(&overlayId, hdr + 4, 4);
+                if (magic == 0x336F574Du) // "MWo3"
+                {
+                    char nameBuf[33]{};
+                    std::memcpy(nameBuf, hdr + 0x20, 32);
+                    activateOverlay(runtime, overlayId, nameBuf, base, size);
+                }
+            }
+        }
+        FUN_00100270_0x100270(rdram, ctx, runtime);
+    }
+
     // 0x001629E8: sceSifCallRpc com trace opcional (EDO_TRACE_RPC=1).
     void sifCallRpcTraced(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -374,6 +486,7 @@ namespace
         std::fprintf(stderr, "[edo] %zu/%zu SDK bindings aplicados\n", bound, std::size(kSdkBindings));
 
         // Sobrescreve handlers genéricos com versões específicas/instrumentadas.
+        runtime.replaceFunction(0x00100270u, overlayActivateHook);
         runtime.replaceFunction(0x0015F068u, ttyWrite);
         runtime.replaceFunction(0x00162808u, sifBindRpcBlocking);
         runtime.replaceFunction(0x001629E8u, sifCallRpcTraced);
