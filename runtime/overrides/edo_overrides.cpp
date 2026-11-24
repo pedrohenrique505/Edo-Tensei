@@ -263,6 +263,20 @@ namespace
         ctx->pc = getRegU32(ctx, 31);
     }
 
+    // 0x003D5700: helper na fronteira do CreateGapFunctions (chamado por BTL.BIN e ADV.BIN).
+    // Se int16(a0) < int16(a1), retorna float(int32(a0)) / float(int32(a1)); senao retorna 1.0f.
+    void ratioClamp1f_003d5700(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const int32_t raw0 = static_cast<int32_t>(getRegU32(ctx, 4));
+        const int32_t raw1 = static_cast<int32_t>(getRegU32(ctx, 5));
+        const int16_t s0 = static_cast<int16_t>(raw0 & 0xFFFF);
+        const int16_t s1 = static_cast<int16_t>(raw1 & 0xFFFF);
+        ctx->f[0] = (s0 < s1) ? (static_cast<float>(raw0) / static_cast<float>(raw1)) : 1.0f;
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
     // 0x00100270: ativacao de overlay MWo3 chamada por FUN_001c3150(slot, filename).
     // Troca os entrypoints do overlay ativo na g_sparseFunctionTable ANTES de
     // FUN_00100270 zerar o .bss e executar os construtores estaticos (.ctors) via FUN_0011a0b0.
@@ -487,6 +501,7 @@ namespace
 
         // Sobrescreve handlers genéricos com versões específicas/instrumentadas.
         runtime.replaceFunction(0x00100270u, overlayActivateHook);
+        runtime.replaceFunction(0x003D5700u, ratioClamp1f_003d5700);
         runtime.replaceFunction(0x0015F068u, ttyWrite);
         runtime.replaceFunction(0x00162808u, sifBindRpcBlocking);
         runtime.replaceFunction(0x001629E8u, sifCallRpcTraced);
