@@ -233,6 +233,19 @@ namespace
         ps2_stubs::sceSifBindRpc(rdram, ctx, runtime);
     }
 
+    // 0x001E1390: player de FMV .PSS (IPU/MPEG2 nao implementado no PS2Recomp).
+    // Pula o video de forma limpa retornando 1 para permitir avancar ao menu/jogo.
+    void skipFmvPlayer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const uint32_t movieId = getRegU32(ctx, 4);
+        std::fprintf(stderr, "[edo:fmv] pulando video .PSS id=%u (IPU/MPEG2 nao implementado)\n", movieId);
+        std::fflush(stderr);
+        setReturnS32(ctx, 1);
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
     // 0x001629E8: sceSifCallRpc com trace opcional (EDO_TRACE_RPC=1).
     void sifCallRpcTraced(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -365,6 +378,7 @@ namespace
         runtime.replaceFunction(0x00162808u, sifBindRpcBlocking);
         runtime.replaceFunction(0x001629E8u, sifCallRpcTraced);
         runtime.replaceFunction(0x001733C0u, cdLayerSearchFile);
+        runtime.replaceFunction(0x001E1390u, skipFmvPlayer);
 
         if (const char *tb = std::getenv("EDO_TRACE_BOOT"); tb && *tb && *tb != '0')
         {
@@ -453,9 +467,36 @@ namespace
                 }
                 FUN_00108e50_0x108e50(r, c, rt);
             });
+            runtime.replaceFunction(0x001C3150u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                const uint32_t a0 = getRegU32(c, 4);
+                const uint32_t a1 = getRegU32(c, 5);
+                const uint8_t *s = a1 ? getConstMemPtr(r, a1) : nullptr;
+                std::fprintf(stderr, "[edo:ovl] FUN_001c3150 a0=%u path=\"%s\" ra=0x%X\n",
+                             a0, s ? reinterpret_cast<const char *>(s) : "(null)", getRegU32(c, 31));
+                std::fflush(stderr);
+                FUN_001c3150_0x1c3150(r, c, rt);
+            });
+            runtime.replaceFunction(0x00113680u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                FUN_00113680_0x113680(r, c, rt);
+                static const bool autoPress = [] {
+                    const char *v = std::getenv("EDO_AUTO_PRESS");
+                    return v && *v && *v != '0';
+                }();
+                static int n = 0;
+                ++n;
+                if (autoPress && n >= 90 && (n % 60) == 0) {
+                    const uint32_t sysPtr = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617EF0u - 0x3F4u));
+                    if (sysPtr) {
+                        uint32_t *padEdge = reinterpret_cast<uint32_t *>(getMemPtr(r, sysPtr + 0x84u));
+                        if (padEdge) {
+                            *padEdge |= 0x840u; // Cross (0x40) | Start (0x800)
+                        }
+                    }
+                }
+            });
             runtime.replaceFunction(0x001D5760u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
                 static int n = 0;
-                if (++n <= 5 || n % 60 == 0) {
+                if (++n <= 5 || n % 120 == 0) {
                     std::fprintf(stderr, "[edo:sched] FUN_001d5760 #%d tid=%d\n", n, rt->eeScheduler().currentThreadId()); std::fflush(stderr);
                 }
                 FUN_001d5760_0x1d5760(r, c, rt);
@@ -585,9 +626,49 @@ namespace
             });
             runtime.replaceFunction(0x001E6500u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
                 static int last = -999;
+                static int16_t lastState = -999;
+                const uint32_t obj = getRegU32(c, 4);
                 FUN_001e6500_0x1e6500(r, c, rt);
                 int v = static_cast<int32_t>(getRegU32(c, 2));
-                if (v != last) { last = v; std::fprintf(stderr, "[edo:wait] FUN_001e6500(mc/save) -> %d\n", v); std::fflush(stderr); }
+                int16_t st = obj ? *reinterpret_cast<const int16_t *>(getConstMemPtr(r, obj)) : -1;
+                if (v != last || st != lastState) {
+                    last = v; lastState = st;
+                    const uint32_t gp4 = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617EF4u));
+                    const uint32_t langObj = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617EF0u - 0x210u));
+                    const uint32_t spr1 = langObj ? *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, langObj + 4u)) : 0u;
+                    std::fprintf(stderr, "[edo:wait] FUN_001e6500(splash) state=%d ret=%d gp4=0x%X langObj=0x%X spr1=0x%X\n",
+                                 st, v, gp4, langObj, spr1);
+                    std::fflush(stderr);
+                }
+            });
+            runtime.replaceFunction(0x001D1180u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int n = 0;
+                if (++n <= 12) {
+                    const uint32_t obj = getRegU32(c, 4);
+                    const int32_t *p = reinterpret_cast<const int32_t *>(getConstMemPtr(r, obj));
+                    std::fprintf(stderr, "[edo:spr] FUN_001d1180 #%d obj=0x%X p0=%d flags=0x%X cnt=%d buf=0x%X max=%d\n",
+                                 n, obj, p ? p[0] : -1, p ? p[1] : 0, p ? p[8] : -1, p ? p[11] : 0, p ? p[9] : -1);
+                    std::fflush(stderr);
+                }
+                FUN_001d1180_0x1d1180(r, c, rt);
+            });
+            runtime.replaceFunction(0x0010F1B0u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int n = 0;
+                const bool log = (++n <= 3);
+                const uint32_t a0 = getRegU32(c, 4);
+                const uint32_t a1 = getRegU32(c, 5);
+                const uint32_t a2 = getRegU32(c, 6);
+                FUN_0010f1b0_0x10f1b0(r, c, rt);
+                if (log) {
+                    const float *in = reinterpret_cast<const float *>(getConstMemPtr(r, a2));
+                    const float *m = reinterpret_cast<const float *>(getConstMemPtr(r, a0 + 0x1c0u));
+                    const int32_t *out = reinterpret_cast<const int32_t *>(getConstMemPtr(r, a1));
+                    std::fprintf(stderr, "[edo:proj] #%d a0=0x%X in=(%.2f,%.2f,%.2f,%.2f) out=(0x%X,0x%X,0x%X,0x%X)\n",
+                                 n, a0, in[0], in[1], in[2], in[3], out[0], out[1], out[2], out[3]);
+                    std::fprintf(stderr, "[edo:proj]   m0=(%.2f,%.2f,%.2f,%.2f) m1=(%.2f,%.2f,%.2f,%.2f) m3=(%.2f,%.2f,%.2f,%.2f)\n",
+                                 m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[12], m[13], m[14], m[15]);
+                    std::fflush(stderr);
+                }
             });
             runtime.replaceFunction(0x00113730u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
                 std::fprintf(stderr, "[edo:boot] -> FUN_00113730 (pad thread)\n"); std::fflush(stderr);
