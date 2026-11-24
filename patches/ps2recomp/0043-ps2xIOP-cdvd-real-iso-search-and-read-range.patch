@@ -1,0 +1,183 @@
+diff --git i/ps2xIOP/src/emulator/imports/iop_cdvd.cpp w/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index ad58fb4..11c4f7d 100644
+--- i/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ w/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -280,6 +280,15 @@ namespace ps2x::iop::detail
+                 cpu.gpr[2] = kCdvdReadyComplete;
+                 return true;
+ 
++            case 14: // sceCdTrayReq(param, u32 *traychk)
++                // SCECdTrayCheck (2) reports whether the medium changed since the
++                // last check; the emulated disc never changes. Open/close succeed.
++                if (a0 == 2u && a1 != 0u)
++                    memory.write32(a1, 0u);
++                lastError = kCdvdErrorNone;
++                cpu.gpr[2] = 1u;
++                return true;
++
+             case 28: // sceCdStatus
+                 cpu.gpr[2] = kCdvdStatusPause;
+                 return true;
+@@ -594,23 +603,145 @@ namespace ps2x::iop::detail
+             return &nodes[current];
+         }
+ 
++        bool searchRealIsoFile(std::string_view guestPath, uint32_t &outLsn, uint32_t &outSize, bool &outDir, std::string &outLeaf)
++        {
++            const std::string imagePath = host.hostPath(HostPathKind::CdImage);
++            if (imagePath.empty())
++                return false;
++            if (imageHandle == 0u)
++                imageHandle = host.openHostFile(imagePath);
++            if (imageHandle == 0u)
++                return false;
++
++            std::string rel(guestPath);
++            // Strip optional "cdrom0:" / "cdrom:" prefix
++            const size_t colon = rel.find(':');
++            if (colon != std::string::npos)
++                rel = rel.substr(colon + 1u);
++            for (char &ch : rel)
++                if (ch == '\\')
++                    ch = '/';
++
++            std::vector<std::string> parts;
++            size_t begin = 0u;
++            while (begin <= rel.size())
++            {
++                const size_t end = rel.find('/', begin);
++                const size_t len = (end == std::string::npos) ? (rel.size() - begin) : (end - begin);
++                const std::string_view seg(rel.data() + begin, len);
++                begin = (end == std::string::npos) ? (rel.size() + 1u) : (end + 1u);
++                if (seg.empty() || seg == ".")
++                    continue;
++                if (seg == "..")
++                    return false;
++                parts.push_back(normalizedIsoComponent(seg));
++            }
++            if (parts.empty())
++                return false;
++
++            std::array<uint8_t, kSectorSize> pvd{};
++            size_t bytesRead = 0u;
++            if (!host.readHostFile(imageHandle, static_cast<uint64_t>(kPrimaryVolumeDescriptorLsn) * kSectorSize,
++                                   pvd.data(), pvd.size(), bytesRead) ||
++                bytesRead != pvd.size() ||
++                std::memcmp(pvd.data() + 1u, "CD001", 5u) != 0)
++            {
++                return false;
++            }
++
++            auto rd32 = [](const uint8_t *p) -> uint32_t {
++                return static_cast<uint32_t>(p[0]) |
++                       (static_cast<uint32_t>(p[1]) << 8u) |
++                       (static_cast<uint32_t>(p[2]) << 16u) |
++                       (static_cast<uint32_t>(p[3]) << 24u);
++            };
++
++            uint32_t curLsn = rd32(pvd.data() + 156u + 2u);
++            uint32_t curSize = rd32(pvd.data() + 156u + 10u);
++            bool curDir = true;
++
++            for (size_t idx = 0u; idx < parts.size(); ++idx)
++            {
++                if (!curDir || curSize == 0u || curSize > 4u * 1024u * 1024u)
++                    return false;
++                std::vector<uint8_t> dirBuf(curSize);
++                size_t got = 0u;
++                if (!host.readHostFile(imageHandle, static_cast<uint64_t>(curLsn) * kSectorSize,
++                                       dirBuf.data(), dirBuf.size(), got) ||
++                    got != dirBuf.size())
++                {
++                    return false;
++                }
++
++                bool found = false;
++                size_t off = 0u;
++                while (off + 33u <= dirBuf.size())
++                {
++                    const uint8_t recLen = dirBuf[off];
++                    if (recLen == 0u)
++                    {
++                        off = ((off / kSectorSize) + 1u) * kSectorSize;
++                        continue;
++                    }
++                    if (off + recLen > dirBuf.size())
++                        break;
++                    const uint8_t idLen = dirBuf[off + 32u];
++                    if (idLen > 0u && off + 33u + idLen <= dirBuf.size())
++                    {
++                        const uint8_t first = dirBuf[off + 33u];
++                        if (!(idLen == 1u && (first == 0u || first == 1u)))
++                        {
++                            const std::string_view idView(reinterpret_cast<const char *>(dirBuf.data() + off + 33u), idLen);
++                            if (normalizedIsoComponent(idView) == parts[idx])
++                            {
++                                curLsn = rd32(dirBuf.data() + off + 2u);
++                                curSize = rd32(dirBuf.data() + off + 10u);
++                                curDir = (dirBuf[off + 25u] & 2u) != 0u;
++                                outLeaf = parts[idx];
++                                found = true;
++                                break;
++                            }
++                        }
++                    }
++                    off += recLen;
++                }
++                if (!found)
++                    return false;
++            }
++
++            outLsn = curLsn;
++            outSize = curSize;
++            outDir = curDir;
++            return true;
++        }
++
+         bool searchFile(uint32_t resultAddress, uint32_t nameAddress)
+         {
+             if (resultAddress == 0u || nameAddress == 0u)
+                 return false;
+ 
+             const std::string guestPath = memory.readString(nameAddress, 1024u);
+-            IsoNode *node = findVirtualIsoNode(guestPath);
+-            if (!node)
+-                return false;
++            uint32_t lsn = 0u;
++            uint32_t size = 0u;
++            bool isDir = false;
++            std::string leaf;
++            if (!searchRealIsoFile(guestPath, lsn, size, isDir, leaf))
++            {
++                IsoNode *node = findVirtualIsoNode(guestPath);
++                if (!node)
++                    return false;
++                lsn = node->lsn;
++                size = node->size;
++                isDir = node->directory;
++                leaf = normalizedIsoComponent(node->identifier);
++            }
+ 
+             // sceCdlFILE: lsn, size, name[16], date/flags[8].
+             std::array<uint8_t, 32u> result{};
+-            writeLe32(result.data(), node->lsn);
+-            writeLe32(result.data() + 4u, node->size);
+-            const std::string leaf = normalizedIsoComponent(node->identifier);
++            writeLe32(result.data(), lsn);
++            writeLe32(result.data() + 4u, size);
+             std::memcpy(result.data() + 8u, leaf.data(), std::min<size_t>(16u, leaf.size()));
+-            result[24u] = node->directory ? 2u : 0u;
++            result[24u] = isDir ? 2u : 0u;
+             return memory.writeRam(resultAddress, result.data(), result.size());
+         }
+ 
+@@ -659,7 +790,8 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             const uint64_t byteCount64 = static_cast<uint64_t>(sectors) * kSectorSize;
+-            if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
++            const uint32_t destPhys = IopMemory::physicalAddress(destination);
++            if (destPhys > IopMemory::RamSize || byteCount64 > IopMemory::RamSize - destPhys)
+             {
+                 lastError = kCdvdErrorRead;
+                 return false;
