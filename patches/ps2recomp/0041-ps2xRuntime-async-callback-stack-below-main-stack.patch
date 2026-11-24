@@ -1,0 +1,245 @@
+diff --git i/ps2xRuntime/src/lib/ps2_runtime.cpp w/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..b8459f4 100644
+--- i/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ w/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,3 +1,7 @@
++#include "runtime/ps2_perf.h"
++#include "runtime/ps2_dbgstat.h"
++#include "runtime/gs/ps2_gs_memory.h"
++#include <cstdio>
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -504,7 +508,10 @@ PS2Runtime::PS2Runtime()
+     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
+     m_guestHeapConfigured = false;
+     m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
++    // Reserva 192 KiB no topo da RAM (0x01FD0000..0x02000000) para a pilha da thread
++    // principal (SetupThread usa 0x01FF8000 em jogos SDK 3.0), evitando que pilhas
++    // de callbacks assíncronos (VSync/INTC) sobrescrevam a pilha de main().
++    m_asyncCallbackStackTop = std::min<uint32_t>(0x01FD0000u, PS2_RAM_SIZE);
+ }
+ 
+ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
+@@ -594,6 +601,7 @@ bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
+ 
+ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
+ {
++    ps2perf::Scope perfScope(ps2perf::IOP);
+     auto scope = m_iopHost->enterCall(ctx, rdram);
+     request.callToken = scope.token();
+     return m_iopSubsystem->handleRpc(request);
+@@ -601,12 +609,14 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
+ 
+ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
+ {
++    ps2perf::Scope perfScope(ps2perf::IOP);
+     auto scope = m_iopHost->enterCall(nullptr, rdram);
+     m_iopSubsystem->onSifTransfer(transfer);
+ }
+ 
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
++    ps2perf::Scope perfScope(ps2perf::IOP);
+     m_iopSubsystem->runEeCycles(eeCycles);
+ }
+ 
+@@ -665,8 +675,10 @@ bool PS2Runtime::syncCoreSubsystems()
+     }
+ 
+     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+-    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+-                                    { m_gs.processGIFPacket(data, size); });
++    auto processGif = [this](const uint8_t *data, uint32_t size)
++    { m_gs.processGIFPacket(data, size); };
++    m_gifArbiter.setProcessPacketFn(processGif);
++    m_memory.setGifPacketCallback(std::move(processGif));
+     m_memory.setGifArbiter(&m_gifArbiter);
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {
+@@ -1086,6 +1098,7 @@ namespace
+         slot = offset >> 2;
+         return slot < g_ps2RecompiledFunctionTableSlotCount;
+     }
++    std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> g_sparseFunctionTable;
+ }
+ 
+ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
+@@ -1093,11 +1106,15 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
+     uint32_t slot = 0u;
+     if (!generatedFunctionTableSlot(address, slot))
+     {
+-        std::cerr << "[function-table] cannot replace guest PC 0x" << std::hex << address
+-                  << ": outside generated dense table [0x" << g_ps2RecompiledFunctionTableBase
+-                  << ", 0x" << g_ps2RecompiledFunctionTableEnd << ")"
+-                  << std::dec << std::endl;
+-        return false;
++        if (func == nullptr)
++        {
++            g_sparseFunctionTable.erase(address);
++        }
++        else
++        {
++            g_sparseFunctionTable[address] = func;
++        }
++        return true;
+     }
+ 
+     g_ps2RecompiledFunctionTable[slot] = func;
+@@ -1112,7 +1129,12 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
+ bool PS2Runtime::hasFunction(uint32_t address) const
+ {
+     uint32_t slot = 0u;
+-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
++    if (generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr)
++    {
++        return true;
++    }
++    const auto it = g_sparseFunctionTable.find(address);
++    return it != g_sparseFunctionTable.end() && it->second != nullptr;
+ }
+ 
+ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -1138,6 +1160,23 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+ {
+     pushDispatchPc(address);
+ 
++    static const bool tracePc = [] {
++        const char *v = std::getenv("EDO_TRACE_PC");
++        return v && *v && *v != '0';
++    }();
++    if (tracePc)
++    {
++        static uint64_t calls = 0;
++        if ((++calls % 200000u) == 0u)
++        {
++            std::fprintf(stderr, "[edo:pc] #%llu tid=%d pc=0x%08X\n",
++                         static_cast<unsigned long long>(calls),
++                         m_eeScheduler ? m_eeScheduler->currentThreadId() : -1,
++                         address);
++            std::fflush(stderr);
++        }
++    }
++
+     uint32_t slot = 0u;
+     if (generatedFunctionTableSlot(address, slot))
+     {
+@@ -1147,6 +1186,14 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+             return fn;
+         }
+     }
++    else if (!g_sparseFunctionTable.empty())
++    {
++        const auto it = g_sparseFunctionTable.find(address);
++        if (it != g_sparseFunctionTable.end() && it->second != nullptr)
++        {
++            return it->second;
++        }
++    }
+ 
+     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
+               << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
+@@ -1356,7 +1403,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // Every inter-function transfer is also a deterministic EE safe point.
+     // Backward edges inside generated functions use eeCheckpointDue(), while
+     // this charge bounds straight-line call chains that have no local loop.
+-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
++    const bool checkpoint = m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles);
++    // COP0 Count ticks at the EE clock. Generated MFC0 reads ctx->cop0_count, so keep
++    // it on the same deterministic clock as VBlank/timers; otherwise games that pace
++    // frames by polling Count never see time advance.
++    if (m_eeScheduler)
++        ctx->cop0_count = static_cast<uint32_t>(m_eeScheduler->eeCycle());
++    if (checkpoint)
+     {
+         return false;
+     }
+@@ -1394,10 +1447,19 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
++    ps2perf::frame(targetPc, m_eeScheduler ? m_eeScheduler->eeCycle() : 0, rdram);
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
++    const uint64_t checkpointGeneration = m_eeScheduler ? m_eeScheduler->checkpointGeneration() : 0u;
+     targetFn(rdram, ctx, this);
+ 
++    // A deeper recursive call can yield with the same PC as this call's entry
++    // (or fallthrough). Unwind before applying implicit HLE return compatibility.
++    if (m_eeScheduler && m_eeScheduler->checkpointGeneration() != checkpointGeneration)
++    {
++        return false;
++    }
++
+     if (isStopRequested() || ctx->pc == 0u)
+     {
+         return false;
+@@ -2403,6 +2465,58 @@ void PS2Runtime::run()
+                 const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
+                 const auto eeSnapshot = m_eeScheduler->snapshot();
+ 
++                {
++                    std::ostringstream fb;
++                    for (uint32_t i = 0; i < 512u; ++i)
++                    {
++                        const uint64_t n = dbgstat::drawsFbp[i].exchange(0, std::memory_order_relaxed);
++                        if (n) fb << ' ' << i << ':' << n;
++                    }
++                    RUNTIME_LOG("[dbgstat] vifCmds=" << dbgstat::vifCmds.exchange(0)
++                                << " direct=" << dbgstat::vifDirect.exchange(0)
++                                << " unpack=" << dbgstat::vifUnpack.exchange(0)
++                                << " mpg=" << dbgstat::vifMpg.exchange(0)
++                                << " mscal=" << dbgstat::vifMscal.exchange(0)
++                                << " mscnt=" << dbgstat::vifMscnt.exchange(0)
++                                << " xgkick=" << dbgstat::xgkick.exchange(0)
++                                << " draws=" << dbgstat::draws.exchange(0)
++                                << " tex=" << dbgstat::drawsTex.exchange(0)
++                                << " fbp{" << fb.str() << " }" << std::endl);
++                    if (tick == 1200) { dbgstat::primBudget.store(40); dbgstat::gifBudget.store(80); }
++                    if (const char *dir = std::getenv("DRA2_DUMP_FB"))
++                    {
++                        struct Fb { uint32_t fbp; bool ct16; };
++                        for (Fb f : {Fb{0, true}, Fb{70, false}, Fb{280, false}})
++                        {
++                            uint8_t *vram = m_memory.getGSVRAM();
++                            char path[512];
++                            std::snprintf(path, sizeof(path), "%s/fb%03u_t%05llu.ppm", dir, f.fbp, (unsigned long long)tick);
++                            FILE *out = std::fopen(path, "wb");
++                            if (!out) continue;
++                            std::fprintf(out, "P6 640 448 255\n");
++                            uint64_t nonBlack = 0;
++                            for (uint32_t y = 0; y < 448; ++y)
++                                for (uint32_t x = 0; x < 640; ++x)
++                                {
++                                    uint8_t rgb[3];
++                                    if (f.ct16)
++                                    {
++                                        const uint32_t c = GSMem::ReadCT16(vram, f.fbp * 32u, 10, x, y);
++                                        rgb[0] = (c & 31u) << 3; rgb[1] = ((c >> 5) & 31u) << 3; rgb[2] = ((c >> 10) & 31u) << 3;
++                                    }
++                                    else
++                                    {
++                                        const uint32_t c = GSMem::ReadCT32(vram, f.fbp * 32u, 10, x, y);
++                                        rgb[0] = c & 0xFF; rgb[1] = (c >> 8) & 0xFF; rgb[2] = (c >> 16) & 0xFF;
++                                    }
++                                    nonBlack += (rgb[0] | rgb[1] | rgb[2]) != 0;
++                                    std::fwrite(rgb, 1, 3, out);
++                                }
++                            std::fclose(out);
++                            RUNTIME_LOG("[dbgstat:fb] fbp=" << f.fbp << " nonBlack=" << nonBlack << std::endl);
++                        }
++                    }
++                }
+                 RUNTIME_LOG("[run:tick] tick=" << tick
+                                                << " pc=0x" << std::hex << dbgPc
+                                                << " ra=0x" << dbgRa
+@@ -2420,6 +2534,8 @@ void PS2Runtime::run()
+ 
+             }
+         });
++        ps2perf::report(ps2perf::guestCounter(m_memory.getRDRAM()), m_memory.gs().vsyncTick.load());
++        ps2perf::Scope presentScope(ps2perf::Present);
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
