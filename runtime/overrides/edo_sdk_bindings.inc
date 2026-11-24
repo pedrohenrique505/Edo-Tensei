@@ -227,4 +227,4 @@
 {0x0017D6F8u, "strncpy"},
 {0x0017D8B8u, "strrchr"},
 {0x0017D908u, "strstr"},
-{0x00180980u, "vsprintf"},
+// vsprintf (0x00180980) mantida recompilada nativamente: ps2_stubs::vsprintf avanca va_list de 4 em 4 bytes (O32), mas EE usa slots de 8 bytes (EABI64).

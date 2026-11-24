@@ -13,9 +13,10 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "ghidra/analyzer/analyzer.toml"
 OUT = ROOT / "runtime/overrides/edo_sdk_bindings.inc"
 
-# Não ligar: substituídos por implementação nossa, ou só TODO no runtime.
+# Não ligar: substituídos por implementação nossa, ou só TODO/ABI incorreta no runtime.
 EXCLUDE = {
     "write",
+    "vsprintf",
     "sceTtyWrite", "sceTtyRead", "sceTtyInit", "sceTtyHandler",
     "sceDeci2Open", "sceDeci2ReqSend", "sceDeci2Poll", "sceDeci2ExRecv", "sceDeci2ExSend",
 }
