@@ -16,13 +16,19 @@
 #include "runtime/ps2_memory.h"
 #include "ps2_recompiled_functions.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <iterator>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #ifdef EDO_HAS_CTORS
 extern void edoRegisterCtorFunctions(PS2Runtime &runtime);
@@ -55,10 +61,147 @@ namespace
         ctx->pc = getRegU32(ctx, 31);
     }
 
-    // 0x001733C0: sceCdLayerSearchFile(fp, name, layer) -> redireciona para sceCdSearchFile HLE
-    // (o jogo é DVD single-layer e o ps2_analyzer classificou como untracked em vez de sceCdSearchFile).
+    struct IsoEntry
+    {
+        uint32_t lsn = 0;
+        uint32_t size = 0;
+        std::string name;
+    };
+
+    const std::unordered_map<std::string, IsoEntry> &isoIndex()
+    {
+        static const std::unordered_map<std::string, IsoEntry> index = [] {
+            std::unordered_map<std::string, IsoEntry> map;
+            const char *isoPath = std::getenv("EDO_ISO");
+            if (!isoPath || !*isoPath)
+            {
+                return map;
+            }
+            std::ifstream f(isoPath, std::ios::binary);
+            if (!f)
+            {
+                return map;
+            }
+            auto readU32LE = [](const uint8_t *p) -> uint32_t {
+                return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                       (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+            };
+            uint8_t pvd[2048]{};
+            f.seekg(16LL * 2048LL);
+            f.read(reinterpret_cast<char *>(pvd), sizeof(pvd));
+            if (f.gcount() != sizeof(pvd) || std::memcmp(pvd + 1, "CD001", 5) != 0)
+            {
+                return map;
+            }
+            const uint32_t rootLba = readU32LE(pvd + 156 + 2);
+            const uint32_t rootSize = readU32LE(pvd + 156 + 10);
+
+            auto walk = [&](auto &&self, uint32_t lba, uint32_t size, const std::string &prefix) -> void {
+                std::vector<uint8_t> buf(size);
+                f.seekg(static_cast<std::streamoff>(lba) * 2048LL);
+                f.read(reinterpret_cast<char *>(buf.data()), static_cast<std::streamsize>(size));
+                size_t i = 0;
+                while (i < buf.size())
+                {
+                    const uint8_t rl = buf[i];
+                    if (rl == 0)
+                    {
+                        i = ((i / 2048u) + 1u) * 2048u;
+                        continue;
+                    }
+                    if (i + 33u > buf.size())
+                    {
+                        break;
+                    }
+                    const uint32_t elba = readU32LE(buf.data() + i + 2);
+                    const uint32_t esz = readU32LE(buf.data() + i + 10);
+                    const uint8_t flags = buf[i + 25];
+                    const uint8_t nlen = buf[i + 32];
+                    if (i + 33u + nlen <= buf.size() && nlen > 0)
+                    {
+                        std::string name(reinterpret_cast<const char *>(buf.data() + i + 33), nlen);
+                        if (!(nlen == 1 && (name[0] == '\0' || name[0] == '\1')))
+                        {
+                            for (char &ch : name)
+                            {
+                                ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                            }
+                            const std::string full = prefix + "/" + name;
+                            if (flags & 2u)
+                            {
+                                self(self, elba, esz, full);
+                            }
+                            else
+                            {
+                                IsoEntry e{elba, esz, name};
+                                map[full] = e;
+                                const auto semi = full.find(';');
+                                if (semi != std::string::npos)
+                                {
+                                    map[full.substr(0, semi)] = e;
+                                }
+                            }
+                        }
+                    }
+                    i += rl;
+                }
+            };
+            walk(walk, rootLba, rootSize, "");
+            std::fprintf(stderr, "[edo] ISO9660 indexado: %zu entradas\n", map.size());
+            return map;
+        }();
+        return index;
+    }
+
+    // 0x001733C0: sceCdLayerSearchFile(fp, name, layer).
+    // Usa os LSNs reais da ISO9660 quando EDO_ISO está definido, para que o EE e o
+    // CRI_ADXI.IRX no IOP leiam exatamente os mesmos setores (em especial DATA.CVM).
     void cdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        const uint32_t fpAddr = getRegU32(ctx, 4);
+        const uint32_t pathAddr = getRegU32(ctx, 5);
+        const auto &idx = isoIndex();
+        if (!idx.empty())
+        {
+            const uint8_t *p = getConstMemPtr(rdram, pathAddr);
+            uint8_t *dst = getMemPtr(rdram, fpAddr);
+            if (p && dst)
+            {
+                std::string raw(reinterpret_cast<const char *>(p), strnlen(reinterpret_cast<const char *>(p), 256));
+                std::string norm;
+                norm.reserve(raw.size() + 1);
+                for (char ch : raw)
+                {
+                    if (ch == '\\')
+                        ch = '/';
+                    norm.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+                }
+                if (norm.rfind("CDROM0:", 0) == 0)
+                    norm.erase(0, 7);
+                if (norm.empty() || norm[0] != '/')
+                    norm.insert(norm.begin(), '/');
+                auto it = idx.find(norm);
+                if (it == idx.end())
+                {
+                    const auto semi = norm.find(';');
+                    if (semi != std::string::npos)
+                        it = idx.find(norm.substr(0, semi));
+                }
+                if (it != idx.end())
+                {
+                    std::memset(dst, 0, 36);
+                    std::memcpy(dst + 0, &it->second.lsn, 4);
+                    std::memcpy(dst + 4, &it->second.size, 4);
+                    const size_t ncopy = std::min<size_t>(it->second.name.size(), 15);
+                    std::memcpy(dst + 8, it->second.name.data(), ncopy);
+                    std::fprintf(stderr, "[edo:cd] search \"%s\" -> lsn=0x%X size=0x%X\n",
+                                 raw.c_str(), it->second.lsn, it->second.size);
+                    setReturnS32(ctx, 1);
+                    ctx->pc = getRegU32(ctx, 31);
+                    return;
+                }
+            }
+        }
         ctx->pc = getRegU32(ctx, 31);
         ps2_stubs::sceCdSearchFile(rdram, ctx, runtime);
     }
