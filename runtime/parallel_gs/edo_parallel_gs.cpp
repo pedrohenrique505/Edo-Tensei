@@ -576,17 +576,36 @@ public:
             return;
         }
         const uint32_t w = slot.width, h = slot.height;
+        const GSRegisters &priv = m_runtime.memory().gs();
+        const uint64_t activeDisp = (priv.pmode & 1u) ? priv.display1 : priv.display2;
+        const uint32_t dispDw = static_cast<uint32_t>((activeDisp >> 32) & 0xFFFu) + 1u;
+        const uint32_t dispMagh = static_cast<uint32_t>((activeDisp >> 23) & 0xFu) + 1u;
+        const uint32_t dispW = dispDw / dispMagh;
         uint32_t targetW = (slot.internalWidth && slot.internalWidth < w)
                                ? slot.internalWidth : w;
-        if (targetW > 640u)
-        {
-            const uint32_t div = (w + 639u) / 640u;
-            targetW = (div > 0u) ? (w / div) : 640u;
-        }
         const bool isFirst = (m_stats.presentedFrames == 0);
         uint64_t rgbSum = 0;
         uint32_t outW = w;
-        if (targetW < w && targetW && w % targetW == 0)
+        if (w > 640u && dispW >= 256u && dispW <= 640u && dispMagh == 1u)
+        {
+            // Quando MAGH=0 (1x), o paraLLEl-GS renderiza os dispW pixels ativos
+            // no canto esquerdo da imagem de scanout (ex: 512 de 2560) com padding preto a direita.
+            m_presentScratch.resize(static_cast<size_t>(dispW) * h * 4);
+            for (uint32_t y = 0; y < h; y++)
+            {
+                const uint8_t *src = rgba + static_cast<size_t>(y) * w * 4;
+                uint8_t *dst = m_presentScratch.data() + static_cast<size_t>(y) * dispW * 4;
+                for (uint32_t x = 0; x < dispW; x++)
+                {
+                    dst[x * 4 + 0] = src[x * 4 + 0];
+                    dst[x * 4 + 1] = src[x * 4 + 1];
+                    dst[x * 4 + 2] = src[x * 4 + 2];
+                    dst[x * 4 + 3] = 0xff;
+                }
+            }
+            outW = dispW;
+        }
+        else if (targetW < w && targetW && w % targetW == 0)
         {
             const uint32_t factor = w / targetW;
             m_presentScratch.resize(static_cast<size_t>(targetW) * h * 4);
@@ -645,14 +664,31 @@ public:
         }
         m_device.unmap_host_buffer(*slot.buffer, Vulkan::MEMORY_ACCESS_READ_BIT);
 
-        if (isFirst || m_stats.presentedFrames == 120 || m_stats.presentedFrames == 121 || m_stats.presentedFrames == 122)
+        if (isFirst)
         {
             for (size_t i = 0; i + 3 < m_presentScratch.size(); i += 4)
                 rgbSum += m_presentScratch[i] + m_presentScratch[i + 1] + m_presentScratch[i + 2];
-            std::fprintf(stderr, "[dra2-gs] quadro #%llu GPU %ux%u brilho médio=%llu\n",
-                         (unsigned long long)m_stats.presentedFrames, w, h,
+            std::fprintf(stderr, "[dra2-gs] primeiro quadro GPU apresentado %ux%u (out=%ux%u) brilho médio=%llu\n",
+                         w, h, outW, h,
                          (unsigned long long)(m_presentScratch.empty() ? 0
                             : rgbSum / (m_presentScratch.size() / 4 * 3)));
+        }
+        static const char *dumpPath = std::getenv("EDO_DUMP_FRAME");
+        static const uint64_t dumpFrameNum = [] {
+            const char *v = std::getenv("EDO_DUMP_FRAME_NUM");
+            return (v && *v) ? std::strtoull(v, nullptr, 10) : 720ull;
+        }();
+        if (dumpPath && *dumpPath && m_stats.presentedFrames == dumpFrameNum)
+        {
+            if (FILE *fp = std::fopen(dumpPath, "wb"))
+            {
+                std::fprintf(fp, "P6\n%u %u\n255\n", outW, h);
+                for (size_t i = 0; i + 3 < m_presentScratch.size(); i += 4)
+                    std::fwrite(&m_presentScratch[i], 1, 3, fp);
+                std::fclose(fp);
+                std::fprintf(stderr, "[edo-gs] frame #%llu salvo em %s (%ux%u)\n",
+                             (unsigned long long)m_stats.presentedFrames, dumpPath, outW, h);
+            }
         }
         static const bool traceFrames = std::getenv("EDO_TRACE_SCANOUT") != nullptr;
         if (traceFrames)
