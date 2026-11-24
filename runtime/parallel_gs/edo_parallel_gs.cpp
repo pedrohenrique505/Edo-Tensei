@@ -640,14 +640,14 @@ public:
         }
         m_device.unmap_host_buffer(*slot.buffer, Vulkan::MEMORY_ACCESS_READ_BIT);
 
-        if (isFirst)
+        if (isFirst || m_stats.presentedFrames == 120 || m_stats.presentedFrames == 121 || m_stats.presentedFrames == 122)
         {
             for (size_t i = 0; i + 3 < m_presentScratch.size(); i += 4)
                 rgbSum += m_presentScratch[i] + m_presentScratch[i + 1] + m_presentScratch[i + 2];
-            std::fprintf(stderr, "[dra2-gs] brilho médio do primeiro quadro GPU: %llu\n",
+            std::fprintf(stderr, "[dra2-gs] quadro #%llu GPU %ux%u brilho médio=%llu\n",
+                         (unsigned long long)m_stats.presentedFrames, w, h,
                          (unsigned long long)(m_presentScratch.empty() ? 0
                             : rgbSum / (m_presentScratch.size() / 4 * 3)));
-            std::fprintf(stderr, "[dra2-gs] primeiro quadro GPU apresentado %ux%u\n", w, h);
         }
         static const bool traceFrames = std::getenv("EDO_TRACE_SCANOUT") != nullptr;
         if (traceFrames)
