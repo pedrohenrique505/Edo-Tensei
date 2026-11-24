@@ -1,0 +1,144 @@
+diff --git i/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp w/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..06354c6 100644
+--- i/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ w/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/ps2_perf.h"
+ #include "runtime/ee_scheduler.h"
+ 
+ #include "ps2_log.h"
+@@ -159,6 +160,7 @@ void EeScheduler::run()
+ 
+     while (!m_stopRequested.load(std::memory_order_acquire))
+     {
++        ps2perf::Scope perfScope(ps2perf::EE);
+         processPendingEvents();
+         if (m_stopRequested.load(std::memory_order_acquire))
+         {
+@@ -296,6 +298,7 @@ void EeScheduler::run()
+         {
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+             m_guestExecuting.store(true, std::memory_order_release);
++            ps2perf::frame(context.pc, m_eeCycle, m_rdram);
+             function(m_rdram, &context, &m_runtime);
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+@@ -361,6 +364,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     if (m_checkpointPending.load(std::memory_order_acquire) ||
+         m_stopRequested.load(std::memory_order_acquire))
+     {
++        ++m_checkpointGeneration;
+         return true;
+     }
+ 
+@@ -368,6 +372,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
+     {
+         m_checkpointPending.store(true, std::memory_order_release);
++        ++m_checkpointGeneration;
+         return true;
+     }
+ 
+@@ -381,6 +386,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     {
+         m_rescheduleRequested = true;
+         m_timeSliceExpired = true;
++        ++m_checkpointGeneration;
+         return true;
+     }
+ 
+@@ -393,7 +399,24 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+     m_eeCycle += elapsed;
+     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+-    m_runtime.advanceIopEeCycles(elapsed);
++
++    // Batch tiny EE cycle slices (~7 us at 294.9 MHz) before crossing into the
++    // IOP subsystem so hot EE loops do not invoke advanceIopEeCycles 500k+/sec.
++    static thread_local const EeScheduler *s_iopBatchOwner = nullptr;
++    static thread_local uint64_t s_iopBatchPending = 0u;
++    if (s_iopBatchOwner != this)
++    {
++        s_iopBatchOwner = this;
++        s_iopBatchPending = 0u;
++    }
++    s_iopBatchPending += elapsed;
++    if (s_iopBatchPending >= 2048u || m_pendingEeTimerInterrupts != 0u)
++    {
++        const uint64_t flushCycles = s_iopBatchPending;
++        s_iopBatchPending = 0u;
++        m_runtime.advanceIopEeCycles(flushCycles);
++    }
++
+     if (m_pendingEeTimerInterrupts != 0u)
+     {
+         m_checkpointPending.store(true, std::memory_order_release);
+@@ -600,7 +623,7 @@ int EeScheduler::suspendThread(int id, bool interruptSafe)
+         m_rescheduleRequested = true;
+     }
+     publishSnapshot();
+-    return KE_OK;
++    return id;
+ }
+ 
+ int EeScheduler::resumeThread(int id, bool interruptSafe)
+@@ -622,7 +645,7 @@ int EeScheduler::resumeThread(int id, bool interruptSafe)
+     --target->suspendCount;
+     if (target->suspendCount != 0)
+     {
+-        return KE_OK;
++        return id;
+     }
+     if (target->status == EeThreadStatus::WaitingSuspended)
+     {
+@@ -634,7 +657,7 @@ int EeScheduler::resumeThread(int id, bool interruptSafe)
+         requestPreemptionIfHigher(*target, interruptSafe);
+     }
+     publishSnapshot();
+-    return KE_OK;
++    return id;
+ }
+ 
+ void EeScheduler::sleepCurrent()
+@@ -677,7 +700,7 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
+         ++target->wakeupCount;
+     }
+     publishSnapshot();
+-    return KE_OK;
++    return id;
+ }
+ 
+ int EeScheduler::cancelWakeup(int id)
+@@ -1287,6 +1310,24 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+     }
+ }
+ 
++// GS interrupt (INTC cause 0). The GS frontend latches SIGNAL/FINISH in CSR bits
++// 0/1 but nothing raised the interrupt, so games that close each frame with a
++// FINISH primitive and wait for their GS handler to acknowledge it (CSR write-1-
++// to-clear) stalled. Delivered at VBlank start; IMR bits 8/9 (SIGMSK/FINISHMSK)
++// mask the sources.
++void EeScheduler::dispatchPendingGsIrq()
++{
++    GSRegisters &gs = m_runtime.memory().gs();
++    const uint64_t csr = gs.csr.load(std::memory_order_acquire);
++    const uint64_t imr = gs.imr;
++    const bool signal = (csr & 0x1ull) != 0u && (imr & 0x100ull) == 0u;
++    const bool finish = (csr & 0x2ull) != 0u && (imr & 0x200ull) == 0u;
++    if (signal || finish)
++    {
++        dispatchIrq(false, 0u);
++    }
++}
++
+ void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
+ {
+     assertExecutor();
+@@ -1901,6 +1942,7 @@ void EeScheduler::processEvent(const EeEvent &event)
+             queueInvocation(std::move(invocation));
+         }
+         dispatchIrq(false, 2u);
++        dispatchPendingGsIrq();
+         break;
+     case EeEventType::ExternalWake:
+         completeExternalWait(event.id, event.value, KE_OK);
