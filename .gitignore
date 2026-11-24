@@ -50,6 +50,7 @@ FLIST.DIR
 # Código gerado pelo recompilador (derivado do código do jogo)
 /generated/
 /generated_ctors/
+/generated_ovl_*/
 /recomp_out/
 
 # PCSX2: savestates, memory cards, dumps de GS/VU
