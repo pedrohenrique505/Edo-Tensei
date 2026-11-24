@@ -113,9 +113,38 @@ public:
             return;
         // Mesma inspeção de tags do replay: IMAGE parcial vai pelo fallback.
         auto load64 = [&](size_t at) { uint64_t v; std::memcpy(&v, data + at, 8); return v; };
-        uint64_t regs[4] = {};
+        uint64_t *regs = m_xferRegs;
         size_t segStart = 0, off = 0;
         bool routed = false;
+        auto checkTrxDir = [&](uint64_t val, size_t atOff) -> bool {
+            regs[3] = val;
+            const uint32_t xdir = regs[3] & 3;
+            const uint32_t spsm = (regs[0] >> 24) & 63;
+            const uint32_t dpsm = (regs[0] >> 56) & 63;
+            if ((xdir == 1 && !bitsPerPixel(spsm)) || (xdir == 2 && (!bitsPerPixel(spsm) || !bitsPerPixel(dpsm))))
+            {
+                static int badCount = 0;
+                if (++badCount <= 10)
+                {
+                    std::fprintf(stderr,
+                                 "[edo-gs] BAD TRXDIR #%d xdir=%u spsm=%u dpsm=%u bitblt=0x%llx trxpos=0x%llx trxreg=0x%llx pktSize=%u off=%zu\n",
+                                 badCount, xdir, spsm, dpsm,
+                                 (unsigned long long)regs[0], (unsigned long long)regs[1], (unsigned long long)regs[2],
+                                 sizeBytes, atOff);
+                    const size_t dumpN = std::min<size_t>(sizeBytes, 64);
+                    std::fprintf(stderr, "[edo-gs] pkt[0..%zu]:", dumpN);
+                    for (size_t k = 0; k < dumpN; k += 4)
+                    {
+                        uint32_t w;
+                        std::memcpy(&w, data + k, 4);
+                        std::fprintf(stderr, " %08X", w);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                return false;
+            }
+            return true;
+        };
         while (off + 16 <= sizeBytes)
         {
             const uint64_t tagLo = load64(off), tagHi = load64(off + 8);
@@ -142,8 +171,10 @@ public:
                     for (uint32_t i = 0; i < nloop && off + 16 <= sizeBytes; ++i, off += 16)
                     {
                         const uint64_t addr = load64(off + 8) & 0xff;
-                        if (addr >= 0x50 && addr <= 0x53)
+                        if (addr >= 0x50 && addr <= 0x52)
                             regs[addr - 0x50] = load64(off);
+                        else if (addr == 0x53 && !checkTrxDir(load64(off), off))
+                            return;
                     }
                 }
                 else
@@ -155,8 +186,10 @@ public:
                             if ((adMask >> r) & 1u)
                             {
                                 const uint64_t addr = load64(off + 8) & 0xff;
-                                if (addr >= 0x50 && addr <= 0x53)
+                                if (addr >= 0x50 && addr <= 0x52)
                                     regs[addr - 0x50] = load64(off);
+                                else if (addr == 0x53 && !checkTrxDir(load64(off), off))
+                                    return;
                             }
                         }
                     }
@@ -164,24 +197,58 @@ public:
             }
             else if (flg == 1)
             {
-                uint32_t count = nloop * nreg;
-                off += count * 8;
+                const uint32_t count = nloop * nreg;
+                for (uint32_t loop = 0; loop < nloop && off + 8 <= sizeBytes; ++loop)
+                {
+                    for (uint32_t r = 0; r < nreg && off + 8 <= sizeBytes; ++r, off += 8)
+                    {
+                        const uint32_t regId = (tagHi >> (r * 4)) & 0xf;
+                        if (regId == 0x0e && off + 8 <= sizeBytes)
+                        {
+                            // REGLIST A+D is invalid on PS2, ignore
+                        }
+                    }
+                }
                 if (count & 1)
                     off += 8;
             }
             else
             {
+                const size_t tagStart = off - 16;
                 uint32_t imageBytes = nloop * 16;
-                if (off + imageBytes > sizeBytes)
-                    imageBytes = sizeBytes - off;
+                const bool truncatedImage = (off + imageBytes > sizeBytes);
+                if (truncatedImage)
+                {
+                    imageBytes = (sizeBytes - off) & ~uint32_t(15);
+                }
                 const unsigned bpp = bitsPerPixel((regs[0] >> 56) & 63);
                 const uint64_t bits = (regs[2] & 0xfff) * ((regs[2] >> 32) & 0xfff) * bpp;
                 if ((regs[3] & 3) == 0 && bpp && bits % 64)
                 {
                     routed = true;
-                    if (off - 16 > segStart)
-                        m_gpu.gif_transfer(1, data + segStart, off - 16 - segStart);
-                    cpuFallbackUpload(regs, data + off, imageBytes);
+                    if (tagStart > segStart)
+                        m_gpu.gif_transfer(1, data + segStart, tagStart - segStart);
+                    if (imageBytes > 0)
+                        cpuFallbackUpload(regs, data + off, imageBytes);
+                    segStart = off + imageBytes;
+                }
+                else if (truncatedImage)
+                {
+                    // ps2_vif1_interpreter envia o restante da imagem em um novo pacote
+                    // com GIFTag IMAGE sintetico. Ajuste/omita o GIFTag truncado aqui
+                    // para manter o stream continuo do paraLLEl-GS perfeitamente alinhado.
+                    routed = true;
+                    if (tagStart > segStart)
+                        m_gpu.gif_transfer(1, data + segStart, tagStart - segStart);
+                    if (imageBytes > 0)
+                    {
+                        uint64_t patchedTag[2] = {
+                            (tagLo & ~uint64_t(0x7FFF)) | static_cast<uint64_t>(imageBytes / 16),
+                            tagHi
+                        };
+                        m_gpu.gif_transfer(1, patchedTag, 16);
+                        m_gpu.gif_transfer(1, data + off, imageBytes);
+                    }
                     segStart = off + imageBytes;
                 }
                 off += imageBytes;
