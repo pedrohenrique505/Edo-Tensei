@@ -14,6 +14,7 @@
 #include "ps2_syscalls.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_memory.h"
+#include "ps2_recompiled_functions.h"
 
 #include <chrono>
 #include <cstdio>
@@ -52,6 +53,14 @@ namespace
             setReturnS32(ctx, len);
         }
         ctx->pc = getRegU32(ctx, 31);
+    }
+
+    // 0x001733C0: sceCdLayerSearchFile(fp, name, layer) -> redireciona para sceCdSearchFile HLE
+    // (o jogo é DVD single-layer e o ps2_analyzer classificou como untracked em vez de sceCdSearchFile).
+    void cdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = getRegU32(ctx, 31);
+        ps2_stubs::sceCdSearchFile(rdram, ctx, runtime);
     }
 
     // 0x00162808: sceSifBindRpc(client, sid, mode) com espera ativa pelas threads do IOP.
@@ -212,6 +221,60 @@ namespace
         runtime.replaceFunction(0x0015F068u, ttyWrite);
         runtime.replaceFunction(0x00162808u, sifBindRpcBlocking);
         runtime.replaceFunction(0x001629E8u, sifCallRpcTraced);
+        runtime.replaceFunction(0x001733C0u, cdLayerSearchFile);
+
+        if (const char *tb = std::getenv("EDO_TRACE_BOOT"); tb && *tb && *tb != '0')
+        {
+            static auto wrapBoot = [](const char *name, PS2Runtime::RecompiledFunction orig) {
+                return [name, orig](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
+                    std::fprintf(stderr, "[edo:boot] -> %s (a0=0x%X a1=0x%X ra=0x%X)\n",
+                                 name, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 31));
+                    std::fflush(stderr);
+                    orig(rdram, ctx, rt);
+                    std::fprintf(stderr, "[edo:boot] <- %s (v0=0x%X)\n", name, getRegU32(ctx, 2));
+                    std::fflush(stderr);
+                };
+            };
+            (void)wrapBoot;
+            runtime.replaceFunction(0x001C1B70u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:boot] -> FUN_001c1b70 (IOP init)\n"); std::fflush(stderr);
+                FUN_001c1b70_0x1c1b70(r, c, rt);
+                std::fprintf(stderr, "[edo:boot] <- FUN_001c1b70\n"); std::fflush(stderr);
+            });
+            runtime.replaceFunction(0x00106100u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:boot] -> FUN_00106100 (pc=0x%X ra=0x%X)\n", c->pc, getRegU32(c, 31)); std::fflush(stderr);
+                FUN_00106100_0x106100(r, c, rt);
+                std::fprintf(stderr, "[edo:boot] <- FUN_00106100 (pc=0x%X ra=0x%X)\n", c->pc, getRegU32(c, 31)); std::fflush(stderr);
+            });
+            runtime.replaceFunction(0x001DFA00u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:boot] -> FUN_001dfa00 (sndbase.irx)\n"); std::fflush(stderr);
+                FUN_001dfa00_0x1dfa00(r, c, rt);
+                std::fprintf(stderr, "[edo:boot] <- FUN_001dfa00\n"); std::fflush(stderr);
+            });
+            runtime.replaceFunction(0x001DFA40u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:boot] -> FUN_001dfa40 (sound init)\n"); std::fflush(stderr);
+                FUN_001dfa40_0x1dfa40(r, c, rt);
+                std::fprintf(stderr, "[edo:boot] <- FUN_001dfa40\n"); std::fflush(stderr);
+            });
+            runtime.replaceFunction(0x001C5EA0u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:boot] -> FUN_001c5ea0\n"); std::fflush(stderr);
+                FUN_001c5ea0_0x1c5ea0(r, c, rt);
+                std::fprintf(stderr, "[edo:boot] <- FUN_001c5ea0\n"); std::fflush(stderr);
+            });
+            runtime.replaceFunction(0x001C1C40u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:boot] -> FUN_001c1c40 (cri_adxi.irx)\n"); std::fflush(stderr);
+                FUN_001c1c40_0x1c1c40(r, c, rt);
+                std::fprintf(stderr, "[edo:boot] <- FUN_001c1c40\n"); std::fflush(stderr);
+            });
+            runtime.replaceFunction(0x001E6B20u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:boot] -> FUN_001e6b20 (main game thread)\n"); std::fflush(stderr);
+                FUN_001e6b20_0x1e6b20(r, c, rt);
+            });
+            runtime.replaceFunction(0x00113730u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:boot] -> FUN_00113730 (pad thread)\n"); std::fflush(stderr);
+                FUN_00113730_0x113730(r, c, rt);
+            });
+        }
     }
 }
 
