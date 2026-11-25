@@ -263,6 +263,105 @@ namespace
         ctx->pc = getRegU32(ctx, 31);
     }
 
+    // 0x0019FEC0: atualizacao hierarquica da matriz mundo de nos da cena (world = parent.world * local).
+    // O codigo gerado pelo PS2Recomp tem bugs em vsqi/vlqi/vlqd (vsqi $vf0, ($vi1++) troca fs/it,
+    // corrompe $vi0 e escreve em RDRAM 0x00000010 em vez de VU0 Data RAM), zerando todas as matrizes
+    // a partir do 1o no filho. Reimplementamos fielmente em C++ mantendo exatamente a mesma semantica.
+    void updateNodeWorldMatrix_0019fec0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        uint32_t node = getRegU32(ctx, 4);
+        if (node == 0u)
+        {
+            ctx->pc = getRegU32(ctx, 31);
+            return;
+        }
+
+        uint32_t chain[256];
+        size_t count = 0;
+        size_t topDirty = 0;
+        uint32_t cur = node;
+        while (cur != 0u && count < 255u)
+        {
+            const uint8_t *p = getConstMemPtr(rdram, cur);
+            if (!p)
+                break;
+            if (static_cast<int8_t>(p[0x8D]) != 0)
+                topDirty = count;
+            chain[count++] = cur;
+            uint32_t parent = 0;
+            std::memcpy(&parent, p + 0x80, 4);
+            cur = parent;
+        }
+        if (count == 0)
+        {
+            ctx->pc = getRegU32(ctx, 31);
+            return;
+        }
+
+        auto mulMat4 = [](float out[16], const float a[16], const float b[16]) {
+            for (int c = 0; c < 4; ++c)
+            {
+                const float bx = b[c * 4 + 0];
+                const float by = b[c * 4 + 1];
+                const float bz = b[c * 4 + 2];
+                const float bw = b[c * 4 + 3];
+                for (int r = 0; r < 4; ++r)
+                {
+                    out[c * 4 + r] = a[0 * 4 + r] * bx + a[1 * 4 + r] * by +
+                                     a[2 * 4 + r] * bz + a[3 * 4 + r] * bw;
+                }
+            }
+        };
+
+        float world[16]{};
+        size_t idx = topDirty;
+        if (idx + 1u < count)
+        {
+            const uint8_t *parentPtr = getConstMemPtr(rdram, chain[idx + 1u]);
+            if (parentPtr)
+                std::memcpy(world, parentPtr, 64);
+            for (size_t step = idx + 1u; step-- > 0;)
+            {
+                uint8_t *nodePtr = getMemPtr(rdram, chain[step]);
+                if (!nodePtr)
+                    break;
+                float local[16];
+                float nextWorld[16];
+                std::memcpy(local, nodePtr + 0x40, 64);
+                mulMat4(nextWorld, world, local);
+                std::memcpy(world, nextWorld, 64);
+                std::memcpy(nodePtr, world, 64);
+                nodePtr[0x8D] = 0;
+            }
+        }
+        else
+        {
+            uint8_t *rootPtr = getMemPtr(rdram, chain[idx]);
+            if (rootPtr)
+            {
+                std::memcpy(world, rootPtr + 0x40, 64);
+                std::memcpy(rootPtr, world, 64);
+                rootPtr[0x8D] = 0;
+            }
+            for (size_t step = idx; step-- > 0;)
+            {
+                uint8_t *nodePtr = getMemPtr(rdram, chain[step]);
+                if (!nodePtr)
+                    break;
+                float local[16];
+                float nextWorld[16];
+                std::memcpy(local, nodePtr + 0x40, 64);
+                mulMat4(nextWorld, world, local);
+                std::memcpy(world, nextWorld, 64);
+                std::memcpy(nodePtr, world, 64);
+                nodePtr[0x8D] = 0;
+            }
+        }
+
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
     // 0x003D5700: helper na fronteira do CreateGapFunctions (chamado por BTL.BIN e ADV.BIN).
     // Se int16(a0) < int16(a1), retorna float(int32(a0)) / float(int32(a1)); senao retorna 1.0f.
     void ratioClamp1f_003d5700(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -501,6 +600,7 @@ namespace
 
         // Sobrescreve handlers genéricos com versões específicas/instrumentadas.
         runtime.replaceFunction(0x00100270u, overlayActivateHook);
+        runtime.replaceFunction(0x0019FEC0u, updateNodeWorldMatrix_0019fec0);
         runtime.replaceFunction(0x003D5700u, ratioClamp1f_003d5700);
         runtime.replaceFunction(0x0015F068u, ttyWrite);
         runtime.replaceFunction(0x00162808u, sifBindRpcBlocking);
@@ -723,10 +823,55 @@ namespace
             });
             runtime.replaceFunction(0x001E4480u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
                 static int n = 0;
-                if (++n <= 5 || n % 60 == 0) {
-                    std::fprintf(stderr, "[edo:state] FUN_001e4480 (state 3 title/menu) #%d\n", n); std::fflush(stderr);
-                }
+                static int lastS0 = -999, lastS6 = -999;
                 FUN_001e4480_0x1e4480(r, c, rt);
+                const uint32_t obj = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617CC4u));
+                const int32_t s0 = obj ? *reinterpret_cast<const int32_t *>(getConstMemPtr(r, obj)) : -1;
+                const int32_t s6 = obj ? *reinterpret_cast<const int32_t *>(getConstMemPtr(r, obj + 0x18u)) : -1;
+                if (++n <= 5 || n % 60 == 0 || s0 != lastS0 || s6 != lastS6) {
+                    lastS0 = s0; lastS6 = s6;
+                    const uint32_t o7 = obj ? *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, obj + 0x1Cu)) : 0;
+                    const uint32_t ob = obj ? *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, obj + 0x2Cu)) : 0;
+                    const uint32_t oc = obj ? *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, obj + 0x30u)) : 0;
+                    std::fprintf(stderr, "[edo:state] FUN_001e4480 #%d s0=%d s6=%d o7=0x%X ob=0x%X oc=0x%X\n",
+                                 n, s0, s6, o7, ob, oc);
+                    std::fflush(stderr);
+                }
+            });
+            runtime.replaceFunction(0x001EF8E0u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int lastS8 = -999, lastSc = -999;
+                FUN_001ef8e0_0x1ef8e0(r, c, rt);
+                const uint32_t obj = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617EF0u - 0x1F0u));
+                const int32_t s8 = obj ? *reinterpret_cast<const int32_t *>(getConstMemPtr(r, obj + 8u)) : -1;
+                const int32_t sc = obj ? *reinterpret_cast<const int32_t *>(getConstMemPtr(r, obj + 12u)) : -1;
+                if (s8 != lastS8 || sc != lastSc) {
+                    lastS8 = s8; lastSc = sc;
+                    std::fprintf(stderr, "[edo:state] FUN_001ef8e0 s8=%d sc=%d\n", s8, sc);
+                    std::fflush(stderr);
+                }
+            });
+            runtime.replaceFunction(0x001EFB70u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int lastSt = -999;
+                FUN_001efb70_0x1efb70(r, c, rt);
+                const uint32_t obj = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617EF0u - 0x1E4u));
+                const int32_t st = obj ? *reinterpret_cast<const int32_t *>(getConstMemPtr(r, obj)) : -1;
+                if (st != lastSt) {
+                    lastSt = st;
+                    std::fprintf(stderr, "[edo:state] FUN_001efb70 st=%d\n", st);
+                    std::fflush(stderr);
+                }
+            });
+            runtime.replaceFunction(0x00184D20u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:fade] FUN_00184d20 frames=%u col=0x%08X ra=0x%X\n",
+                             getRegU32(c, 5), getRegU32(c, 6), getRegU32(c, 31));
+                std::fflush(stderr);
+                FUN_00184d20_0x184d20(r, c, rt);
+            });
+            runtime.replaceFunction(0x00184E60u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:fade] FUN_00184e60 frames=%u c0=0x%08X c1=0x%08X ra=0x%X\n",
+                             getRegU32(c, 5), getRegU32(c, 6), getRegU32(c, 7), getRegU32(c, 31));
+                std::fflush(stderr);
+                FUN_00184e60_0x184e60(r, c, rt);
             });
             runtime.replaceFunction(0x001D5540u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
                 static int n = 0;
