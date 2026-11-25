@@ -1,0 +1,236 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -31,6 +31,7 @@ namespace ps2x::iop
+         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
+         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
++        uint32_t sdRemote(uint32_t cmd, uint32_t arg0, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4);
+         void onSifTransfer(const SifTransfer &transfer);
+ 
+         // Physical IOP RAM access shared by the emulator, SIF DMA, and HLE services. Addresses are IOP addresses.
+diff --git a/ps2xIOP/src/emulator/imports/iop_libsd.h b/ps2xIOP/src/emulator/imports/iop_libsd.h
+--- a/ps2xIOP/src/emulator/imports/iop_libsd.h
++++ b/ps2xIOP/src/emulator/imports/iop_libsd.h
+@@ -25,6 +25,13 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal,
+                                           IopCpuState &cpu,
+                                           uint64_t currentCycle);
++        uint32_t handleRemote(uint32_t cmd,
++                              uint32_t arg0,
++                              uint32_t arg1,
++                              uint32_t arg2,
++                              uint32_t arg3,
++                              uint32_t arg4,
++                              uint64_t currentCycle);
+         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
+         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+ 
+diff --git a/ps2xIOP/src/emulator/imports/iop_libsd.cpp b/ps2xIOP/src/emulator/imports/iop_libsd.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_libsd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_libsd.cpp
+@@ -895,6 +895,84 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
++    uint32_t IopLibsd::handleRemote(uint32_t cmd,
++                                    uint32_t arg0,
++                                    uint32_t arg1,
++                                    uint32_t arg2,
++                                    uint32_t arg3,
++                                    uint32_t arg4,
++                                    uint64_t currentCycle)
++    {
++        auto ensureMixScheduled = [&]() {
++            if (m_nextMixCycle == UINT64_MAX)
++                m_nextMixCycle = currentCycle + kCyclesPerMixChunk;
++        };
++
++        switch (cmd)
++        {
++        case 0x8010u: // rSdSetParam(entry, value)
++            setParam(static_cast<uint16_t>(arg0), static_cast<uint16_t>(arg1));
++            return 0u;
++
++        case 0x8020u: // rSdGetParam(entry)
++            return getParam(static_cast<uint16_t>(arg0));
++
++        case 0x80E0u: // rSdBlockTrans(ch, mode, mAddr, size, startAddr)
++        {
++            const uint32_t ch = arg0 & 1u;
++            const uint32_t mode = arg1 & 0x03u;
++            const bool loop = (arg1 & 0x10u) != 0u;
++            const uint32_t mAddr = arg2;
++            const uint32_t size = arg3;
++            DmaChannel &dma = m_dma[ch];
++
++            if (mode == 2u) // SD_TRANS_MODE_STOP
++            {
++                const uint32_t curAddr = dma.blockActive ? (dma.blockAddr + dma.blockPosFrames * 4u) : 0u;
++                const uint32_t status = dma.blockActive
++                                            ? ((dma.blockHalfIndex << 24u) | (curAddr & 0x00FFFFFFu))
++                                            : 0u;
++                dma.blockActive = false;
++                dma.blockLoop = false;
++                return status;
++            }
++
++            if (mode == 0u || mode == 3u) // SD_TRANS_MODE_WRITE / SD_TRANS_MODE_WRITE_FROM
++            {
++                if (size < 1024u)
++                    return static_cast<uint32_t>(-1);
++                dma.blockAddr = mAddr;
++                dma.blockSize = size;
++                dma.blockTotalFrames = size / 4u;
++                dma.blockHalfFrames = dma.blockTotalFrames / 2u;
++                dma.blockPosFrames = 0u;
++                if (mode == 3u && arg4 >= mAddr && arg4 < mAddr + size)
++                    dma.blockPosFrames = (arg4 - mAddr) / 4u;
++                dma.blockHalfIndex = (dma.blockPosFrames >= dma.blockHalfFrames) ? 1u : 0u;
++                dma.blockLoop = loop;
++                dma.blockActive = true;
++                m_initialized = true;
++                ensureMixScheduled();
++                return 0u;
++            }
++            return 0u;
++        }
++
++        case 0x8100u: // rSdBlockTransStatus(ch, flag)
++        {
++            const uint32_t ch = arg0 & 1u;
++            const DmaChannel &dma = m_dma[ch];
++            if (!dma.blockActive)
++                return 0u;
++            const uint32_t curAddr = dma.blockAddr + dma.blockPosFrames * 4u;
++            return (dma.blockHalfIndex << 24u) | (curAddr & 0x00FFFFFFu);
++        }
++
++        default:
++            return 0u;
++        }
++    }
++
+     uint64_t IopLibsd::nextEventCycle(uint64_t fallback) const noexcept
+     {
+         return m_nextMixCycle != UINT64_MAX ? m_nextMixCycle : fallback;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -27,6 +27,7 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
+         void runEeCycles(uint64_t eeCycles) noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
++        uint32_t sdRemote(uint32_t cmd, uint32_t arg0, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4);
+         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
+         void onSifTransfer(const SifTransfer &transfer);
+ 
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -805,6 +805,16 @@ namespace ps2x::iop::detail
+         return m_impl->rpc.handleRpc(request, *m_impl);
+     }
+ 
++    uint32_t IopEmulator::sdRemote(uint32_t cmd, uint32_t arg0, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4)
++    {
++        if (const uint64_t iopCycles = m_impl->eeCycleCarry / 8u; iopCycles != 0u)
++        {
++            m_impl->eeCycleCarry %= 8u;
++            m_impl->runCycles(iopCycles);
++        }
++        return m_impl->libsd.handleRemote(cmd, arg0, arg1, arg2, arg3, arg4, m_impl->totalCycles);
++    }
++
+     bool IopEmulator::hasRpcServer(uint32_t sid) const noexcept
+     {
+         return m_impl->rpc.hasServer(sid);
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -201,6 +201,11 @@ namespace ps2x::iop
+         m_impl->emulator.runEeCycles(eeCycles);
+     }
+ 
++    uint32_t IopSubsystem::sdRemote(uint32_t cmd, uint32_t arg0, uint32_t arg1, uint32_t arg2, uint32_t arg3, uint32_t arg4)
++    {
++        return m_impl->emulator.sdRemote(cmd, arg0, arg1, arg2, arg3, arg4);
++    }
++
+     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
+     {
+         for (const auto &service : m_impl->coreServices)
+diff --git a/ps2xRuntime/src/lib/ps2_iop_transport.h b/ps2xRuntime/src/lib/ps2_iop_transport.h
+--- a/ps2xRuntime/src/lib/ps2_iop_transport.h
++++ b/ps2xRuntime/src/lib/ps2_iop_transport.h
+@@ -51,4 +51,13 @@ public:
+             runtime->resetIop();
+         }
+     }
++
++    static uint32_t sdRemote(
++        PS2Runtime *runtime,
++        uint32_t cmd,
++        uint32_t arg0,
++        uint32_t arg1,
++        uint32_t arg2,
++        uint32_t arg3,
++        uint32_t arg4);
+ };
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2_host_backend.h"
+ #include "ps2_iop_host.h"
+ #include "ps2_runtime.h"
++#include "ps2_iop_transport.h"
+ #include "ps2_runtime_calls.h"
+ #include "ps2_syscalls.h"
+ #include "ps2_stubs.h"
+@@ -598,6 +599,21 @@ bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
+     return m_iopSubsystem->canBindRpc(sid);
+ }
+ 
++uint32_t PS2IopTransport::sdRemote(
++    PS2Runtime *runtime,
++    uint32_t cmd,
++    uint32_t arg0,
++    uint32_t arg1,
++    uint32_t arg2,
++    uint32_t arg3,
++    uint32_t arg4)
++{
++    if (!runtime || !runtime->m_iopSubsystem)
++        return 0u;
++    auto scope = runtime->m_iopHost->enterCall(nullptr, runtime->m_memory.getRDRAM());
++    return runtime->m_iopSubsystem->sdRemote(cmd, arg0, arg1, arg2, arg3, arg4);
++}
++
+ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
+ {
+     auto scope = m_iopHost->enterCall(ctx, rdram);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
+@@ -1,5 +1,6 @@
+ #include "Common.h"
+ #include "Audio.h"
++#include "../../ps2_iop_transport.h"
+ 
+ namespace ps2_stubs
+ {
+@@ -92,6 +93,13 @@ namespace ps2_stubs
+         const uint32_t arg5 = (arg5Reg != 0u) ? arg5Reg : arg5Stk;
+         const uint32_t arg6 = (arg6Reg != 0u) ? arg6Reg : arg6Stk;
+ 
++        if (runtime && (cmd == 0x8010u || cmd == 0x8020u || cmd == kLibSdCmdBlockTrans || cmd == kLibSdCmdBlockTransStatus))
++        {
++            const uint32_t res = PS2IopTransport::sdRemote(runtime, cmd, cmdArg0, cmdArg1, arg4, arg5, arg6);
++            setReturnU32(ctx, res);
++            return;
++        }
++
+         std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
+         g_audio_stub_state.initialized = true;
+         const uint32_t core = cmdArg0 & (kLibSdCoreCount - 1u);

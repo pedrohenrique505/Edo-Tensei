@@ -1,5 +1,5 @@
 diff --git i/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp w/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-index 44eaef4..1a4dc41 100644
+index 44eaef4..409213f 100644
 --- i/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 +++ w/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 @@ -1579,25 +1579,63 @@ namespace ps2_stubs
@@ -125,7 +125,18 @@ index 44eaef4..1a4dc41 100644
          }
  
          void dispatchStreamCallbacksUnlocked(uint8_t *rdram,
-@@ -2141,8 +2194,8 @@ namespace ps2_stubs
+@@ -2112,6 +2165,10 @@ namespace ps2_stubs
+                     std::cerr << "[MPEG:DemuxPss:BACKPRESSURE] mpeg=0x" << std::hex << mpegAddr << std::dec << " decoded=" << decodedCount << std::endl;
+                 });
+             }
++            if (runtime)
++            {
++                runtime->eeScheduler().accountCycles(200000u);
++            }
+             setReturnS32(ctx, 0);
+             return;
+         }
+@@ -2141,8 +2198,8 @@ namespace ps2_stubs
              });
          }
  
@@ -135,7 +146,18 @@ index 44eaef4..1a4dc41 100644
      }
  
      void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-@@ -2235,8 +2288,8 @@ namespace ps2_stubs
+@@ -2205,6 +2262,10 @@ namespace ps2_stubs
+                               << " avail=" << availableBytes << std::endl;
+                 });
+             }
++            if (runtime)
++            {
++                runtime->eeScheduler().accountCycles(200000u);
++            }
+             setReturnS32(ctx, 0);
+             return;
+         }
+@@ -2235,8 +2296,8 @@ namespace ps2_stubs
              });
          }
  
