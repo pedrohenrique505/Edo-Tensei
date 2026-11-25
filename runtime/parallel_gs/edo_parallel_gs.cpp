@@ -449,9 +449,26 @@ public:
             std::memcpy(&p.pmode, &priv.pmode, 8);
             std::memcpy(&p.smode2, &priv.smode2, 8);
             std::memcpy(&p.dispfb1, &priv.dispfb1, 8);
-            std::memcpy(&p.display1, &priv.display1, 8);
+            auto normalizeDisplay = [](uint64_t disp) -> uint64_t {
+                const uint32_t dw = static_cast<uint32_t>((disp >> 32) & 0xFFFu) + 1u;
+                const uint32_t magh = static_cast<uint32_t>((disp >> 23) & 0xFu);
+                if (magh == 0u && dw >= 256u && dw <= 640u)
+                {
+                    // ps2_stubs::sceGsSetDefDispEnv grava MAGH=0 e DW=w-1; no hardware PS2
+                    // real (FUN_0014f878), MAGH=(w+2559)/w - 1 e DW=w*(MAGH+1)-1 (ex: 512 -> MAGH=4, DW=2559).
+                    const uint32_t scale = (dw + 2559u) / dw;
+                    const uint64_t newMagh = static_cast<uint64_t>(scale - 1u) & 0xFu;
+                    const uint64_t newDw = static_cast<uint64_t>(dw * scale - 1u) & 0xFFFu;
+                    disp &= ~((0xFull << 23) | (0xFFFull << 32));
+                    disp |= (newMagh << 23) | (newDw << 32);
+                }
+                return disp;
+            };
+            const uint64_t normDisp1 = normalizeDisplay(priv.display1);
+            const uint64_t normDisp2 = normalizeDisplay(priv.display2);
+            std::memcpy(&p.display1, &normDisp1, 8);
             std::memcpy(&p.dispfb2, &priv.dispfb2, 8);
-            std::memcpy(&p.display2, &priv.display2, 8);
+            std::memcpy(&p.display2, &normDisp2, 8);
             std::memcpy(&p.bgcolor, &priv.bgcolor, 8);
             ParallelGS::VSyncInfo info{};
             info.phase = m_stats.latches & 1;
