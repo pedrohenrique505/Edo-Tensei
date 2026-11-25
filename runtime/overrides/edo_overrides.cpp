@@ -250,17 +250,30 @@ namespace
         ps2_stubs::sceSifBindRpc(rdram, ctx, runtime);
     }
 
-    // 0x001E1390: player de FMV .PSS (IPU/MPEG2 nao implementado no PS2Recomp).
-    // Pula o video de forma limpa retornando 1 para permitir avancar ao menu/jogo.
-    void skipFmvPlayer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // 0x001E1390: player de FMV .PSS (sceMpeg + FFmpeg via PS2Recomp).
+    // Se EDO_SKIP_FMV=1 estiver definido, pula o video imediatamente retornando 1.
+    void fmvPlayerHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
-        (void)runtime;
+        static const bool skipFmv = [] {
+            const char *v = std::getenv("EDO_SKIP_FMV");
+            return v && *v && *v != '0';
+        }();
         const uint32_t movieId = getRegU32(ctx, 4);
-        std::fprintf(stderr, "[edo:fmv] pulando video .PSS id=%u (IPU/MPEG2 nao implementado)\n", movieId);
+        const uint32_t flags = getRegU32(ctx, 5);
+        if (skipFmv)
+        {
+            std::fprintf(stderr, "[edo:fmv] pulando video .PSS id=%u (EDO_SKIP_FMV=1)\n", movieId);
+            std::fflush(stderr);
+            setReturnS32(ctx, 1);
+            ctx->pc = getRegU32(ctx, 31);
+            return;
+        }
+        std::fprintf(stderr, "[edo:fmv] -> reproduzindo video .PSS id=%u flags=0x%X\n", movieId, flags);
         std::fflush(stderr);
-        setReturnS32(ctx, 1);
-        ctx->pc = getRegU32(ctx, 31);
+        FUN_001e1390_0x1e1390(rdram, ctx, runtime);
+        std::fprintf(stderr, "[edo:fmv] <- video .PSS id=%u finalizado (ret=%d)\n",
+                     movieId, static_cast<int32_t>(getRegU32(ctx, 2)));
+        std::fflush(stderr);
     }
 
     // 0x0019FEC0: atualizacao hierarquica da matriz mundo de nos da cena (world = parent.world * local).
@@ -598,6 +611,14 @@ namespace
         }
         std::fprintf(stderr, "[edo] %zu/%zu SDK bindings aplicados\n", bound, std::size(kSdkBindings));
 
+        // Bindings de libmpeg que o ps2_analyzer nao identificou automaticamente.
+        sdkHandlers()[0x001595E0u] = &ps2_stubs::sceMpegDelete;
+        runtime.replaceFunction(0x001595E0u, sdkTrampoline);
+        sdkHandlers()[0x00159748u] = &ps2_stubs::sceMpegIsEnd;
+        runtime.replaceFunction(0x00159748u, sdkTrampoline);
+        sdkHandlers()[0x00159758u] = &ps2_stubs::sceMpegIsRefBuffEmpty;
+        runtime.replaceFunction(0x00159758u, sdkTrampoline);
+
         // Sobrescreve handlers genéricos com versões específicas/instrumentadas.
         runtime.replaceFunction(0x00100270u, overlayActivateHook);
         runtime.replaceFunction(0x0019FEC0u, updateNodeWorldMatrix_0019fec0);
@@ -606,7 +627,152 @@ namespace
         runtime.replaceFunction(0x00162808u, sifBindRpcBlocking);
         runtime.replaceFunction(0x001629E8u, sifCallRpcTraced);
         runtime.replaceFunction(0x001733C0u, cdLayerSearchFile);
-        runtime.replaceFunction(0x001E1390u, skipFmvPlayer);
+        runtime.replaceFunction(0x001E1390u, fmvPlayerHook);
+
+        if (const char *tf = std::getenv("EDO_TRACE_FMV"); tf && *tf && *tf != '0')
+        {
+            runtime.replaceFunction(0x0015DC20u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:fmv] sceMpegAddStrCallback mp=0x%X type=%u ch=%u fn=0x%X data=0x%X\n",
+                             getRegU32(c, 4), getRegU32(c, 5), getRegU32(c, 6), getRegU32(c, 7), getRegU32(c, 8));
+                std::fflush(stderr);
+                c->pc = getRegU32(c, 31);
+                ps2_stubs::sceMpegAddStrCallback(r, c, rt);
+            });
+            runtime.replaceFunction(0x0015D820u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int n = 0;
+                const int id = ++n;
+                const uint32_t mp = getRegU32(c, 4);
+                const uint32_t data = getRegU32(c, 5);
+                const uint32_t avail = getRegU32(c, 6);
+                const uint32_t ring = getRegU32(c, 7);
+                const uint32_t rsz = getRegU32(c, 8);
+                c->pc = getRegU32(c, 31);
+                ps2_stubs::sceMpegDemuxPssRing(r, c, rt);
+                const int32_t ret = static_cast<int32_t>(getRegU32(c, 2));
+                if (id <= 12 || (id % 200 == 0))
+                {
+                    std::fprintf(stderr, "[edo:fmv] sceMpegDemuxPssRing #%d mp=0x%X data=0x%X avail=%u ring=0x%X rsz=0x%X -> %d\n",
+                                 id, mp, data, avail, ring, rsz, ret);
+                    std::fflush(stderr);
+                }
+            });
+            runtime.replaceFunction(0x00104800u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int n = 0;
+                const int id = ++n;
+                if (id <= 5)
+                {
+                    std::fprintf(stderr, "[edo:fmv] -> FUN_00104800 (videoCb) #%d\n", id);
+                    std::fflush(stderr);
+                }
+                FUN_00104800_0x104800(r, c, rt);
+                if (id <= 5)
+                {
+                    std::fprintf(stderr, "[edo:fmv] <- FUN_00104800 (videoCb) #%d ret=%d\n", id, static_cast<int32_t>(getRegU32(c, 2)));
+                    std::fflush(stderr);
+                }
+            });
+            runtime.replaceFunction(0x00159628u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int n = 0;
+                const int id = ++n;
+                const uint32_t mp = getRegU32(c, 4);
+                const uint32_t img = getRegU32(c, 5);
+                if (id <= 8 || id % 30 == 0)
+                {
+                    std::fprintf(stderr, "[edo:fmv] -> sceMpegGetPicture #%d mp=0x%X img=0x%X\n", id, mp, img);
+                    std::fflush(stderr);
+                }
+                c->pc = getRegU32(c, 31);
+                ps2_stubs::sceMpegGetPicture(r, c, rt);
+                if (id <= 8 || id % 30 == 0)
+                {
+                    const uint32_t *m = reinterpret_cast<const uint32_t *>(getConstMemPtr(r, mp));
+                    std::fprintf(stderr, "[edo:fmv] <- sceMpegGetPicture #%d ret=%d %ux%u frame=%u\n",
+                                 id, static_cast<int32_t>(getRegU32(c, 2)),
+                                 m ? m[0] : 0u, m ? m[1] : 0u, m ? m[2] : 0u);
+                    std::fflush(stderr);
+                }
+            });
+            runtime.replaceFunction(0x001044A0u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:fmv] FUN_001044a0 (startDisplay) a0=%u\n", getRegU32(c, 4));
+                std::fflush(stderr);
+                FUN_001044a0_0x1044a0(r, c, rt);
+            });
+            runtime.replaceFunction(0x00104990u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int n = 0;
+                if (++n <= 5)
+                {
+                    std::fprintf(stderr, "[edo:fmv] FUN_00104990 (buildGif) #%d w=%u h=%u\n", n, getRegU32(c, 7), getRegU32(c, 8));
+                    std::fflush(stderr);
+                }
+                FUN_00104990_0x104990(r, c, rt);
+            });
+            runtime.replaceFunction(0x00105120u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int n = 0;
+                if (++n <= 8 || n % 60 == 0)
+                {
+                    std::fprintf(stderr, "[edo:fmv] FUN_00105120 (dispDone) #%d\n", n);
+                    std::fflush(stderr);
+                }
+                FUN_00105120_0x105120(r, c, rt);
+            });
+            runtime.replaceFunction(0x001011F0u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                std::fprintf(stderr, "[edo:fmv] FUN_001011f0 (audioStart) aoBuf=0x%X\n", getRegU32(c, 4));
+                std::fflush(stderr);
+                FUN_001011f0_0x1011f0(r, c, rt);
+            });
+            runtime.replaceFunction(0x001046A0u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int n = 0;
+                const int id = ++n;
+                const uint32_t cbData = getRegU32(c, 5);
+                const uint32_t user = getRegU32(c, 6);
+                const uint32_t dataAddr = cbData ? *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, cbData + 8u)) : 0u;
+                const uint32_t dataLen = cbData ? *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, cbData + 12u)) : 0u;
+                FUN_001046a0_0x1046a0(r, c, rt);
+                if (id <= 10 || id % 100 == 0)
+                {
+                    std::fprintf(stderr, "[edo:fmv] FUN_001046a0 (pcmCb) #%d data=0x%X len=%u user=0x%X ret=%d\n",
+                                 id, dataAddr, dataLen, user, static_cast<int32_t>(getRegU32(c, 2)));
+                    std::fflush(stderr);
+                }
+            });
+            runtime.replaceFunction(0x00100C20u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int n = 0;
+                const int id = ++n;
+                FUN_00100c20_0x100c20(r, c, rt);
+                const int32_t ret = static_cast<int32_t>(getRegU32(c, 2));
+                if (id <= 5 || ret > 0)
+                {
+                    static int sentLogs = 0;
+                    if (id <= 5 || ++sentLogs <= 10)
+                    {
+                        std::fprintf(stderr, "[edo:fmv] FUN_00100c20 (aoSend) #%d ret=%d\n", id, ret);
+                        std::fflush(stderr);
+                    }
+                }
+            });
+            runtime.replaceFunction(0x001057B0u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int n = 0;
+                FUN_001057b0_0x1057b0(r, c, rt);
+                if (++n <= 5 || n % 15 == 0)
+                {
+                    const uint32_t ctrl = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617B3Cu));
+                    const uint32_t vo = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617B28u));
+                    const uint32_t ao = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617B18u));
+                    const uint32_t mp = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617B14u));
+                    const uint8_t ctrlState = ctrl ? *getConstMemPtr(r, ctrl + 0x3Au) : 0xFF;
+                    const int32_t voCnt = vo ? *reinterpret_cast<const int32_t *>(getConstMemPtr(r, vo + 0x1Cu)) : -1;
+                    const int32_t voMax = vo ? *reinterpret_cast<const int32_t *>(getConstMemPtr(r, vo + 0x20u)) : -1;
+                    const int32_t aoState = ao ? *reinterpret_cast<const int32_t *>(getConstMemPtr(r, ao)) : -1;
+                    const int32_t aoSent = ao ? *reinterpret_cast<const int32_t *>(getConstMemPtr(r, ao + 0x54u)) : -1;
+                    const int32_t aoIopSz = ao ? *reinterpret_cast<const int32_t *>(getConstMemPtr(r, ao + 0x48u)) : -1;
+                    const int32_t mpFrames = mp ? *reinterpret_cast<const int32_t *>(getConstMemPtr(r, mp + 0x08u)) : -1;
+                    const uint32_t dispOn = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617B40u));
+                    std::fprintf(stderr, "[edo:fmv] poll #%d ret=%u ctrlSt=%u dispOn=%u vo=%d/%d ao=(st=%d sent=%d/%d) mpFrames=%d\n",
+                                 n, getRegU32(c, 2), ctrlState, dispOn, voCnt, voMax, aoState, aoSent, aoIopSz, mpFrames);
+                    std::fflush(stderr);
+                }
+            });
+        }
 
         if (const char *tb = std::getenv("EDO_TRACE_BOOT"); tb && *tb && *tb != '0')
         {
