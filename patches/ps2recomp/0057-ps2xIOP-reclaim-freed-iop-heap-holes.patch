@@ -1,0 +1,63 @@
+diff --git i/ps2xIOP/src/emulator/core/iop_memory.cpp w/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 25e9b36..8ba310b 100644
+--- i/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ w/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -299,23 +299,36 @@ namespace ps2x::iop::detail
+             return address;
+         }
+ 
+-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+-        for (;;)
++        auto findSlot = [&](uint32_t start) -> uint32_t
+         {
+-            bool overlap = false;
+-            for (const auto &block : m_allocations)
++            uint32_t candidate = alignUp(start, alignment);
++            for (;;)
+             {
+-                if (candidate < block.address + block.size && block.address < candidate + size)
++                bool overlap = false;
++                for (const auto &block : m_allocations)
+                 {
+-                    candidate = alignUp(block.address + block.size, alignment);
+-                    overlap = true;
+-                    break;
++                    if (candidate < block.address + block.size && block.address < candidate + size)
++                    {
++                        candidate = alignUp(block.address + block.size, alignment);
++                        overlap = true;
++                        break;
++                    }
+                 }
++                if (!overlap)
++                    break;
+             }
+-            if (!overlap)
+-                break;
++            if (candidate > HeapLimit || size > HeapLimit - candidate)
++                return 0u;
++            return candidate;
++        };
++
++        uint32_t candidate = findSlot(m_heapCursor);
++        if (candidate == 0u)
++        {
++            // Reclaim holes freed below m_heapCursor (e.g., repeated sceSifAllocIopHeap/FreeIopHeap).
++            candidate = findSlot(HeapBase);
+         }
+-        if (candidate > HeapLimit || size > HeapLimit - candidate)
++        if (candidate == 0u)
+             return 0u;
+         m_allocations.push_back({candidate, size});
+         markOwned(candidate, size);
+@@ -334,6 +347,10 @@ namespace ps2x::iop::detail
+                   m_owned.begin() + block->address + block->size,
+                   uint8_t{0});
+         m_allocations.erase(block);
++        uint32_t highestEnd = HeapBase;
++        for (const auto &alloc : m_allocations)
++            highestEnd = std::max(highestEnd, alloc.address + alloc.size);
++        m_heapCursor = highestEnd;
+         return true;
+     }
+ 
