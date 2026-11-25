@@ -1,0 +1,24 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1148,11 +1148,19 @@ void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations
+     GuestThread *owner = currentThread();
+     assert(owner != nullptr);
+     assert(!invocations.empty());
++    // Sibling invocations in a sequence execute sequentially one after another
++    // (never nested on top of each other), so they can safely share a single
++    // invocation stack frame instead of reserving N separate 16 KiB stacks.
++    uint32_t sharedSp = 0u;
+     for (auto it = invocations.rbegin(); it != invocations.rend(); ++it)
+     {
+         if (getRegU32(&it->context, 29) == 0u)
+         {
+-            SET_GPR_U32(&it->context, 29, invocationStackTop());
++            if (sharedSp == 0u)
++            {
++                sharedSp = invocationStackTop();
++            }
++            SET_GPR_U32(&it->context, 29, sharedSp);
+         }
+         it->sequence = ++m_invocationSequence;
+         owner->invocations.push_back(std::move(*it));
