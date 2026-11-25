@@ -1,0 +1,147 @@
+diff --git i/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp w/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 44eaef4..1a4dc41 100644
+--- i/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ w/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -1579,25 +1579,63 @@ namespace ps2_stubs
+             return true;
+         }
+ 
+-        void dispatchGuestStreamCallback(uint8_t *rdram,
+-                                         R5900Context *callerCtx,
+-                                         PS2Runtime *runtime,
+-                                         const MpegStreamCallbackEvent &event,
+-                                         const MpegRegisteredCallback &callback)
++        uint32_t allocateMpegCallbackData(PS2Runtime *runtime, bool &outFromHeap)
++        {
++            outFromHeap = false;
++            if (!runtime)
++            {
++                return 0u;
++            }
++            if (const uint32_t heapAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u); heapAddr != 0u)
++            {
++                outFromHeap = true;
++                return heapAddr;
++            }
++
++            // Fallback when the game's custom allocator owns the entire guest heap:
++            // reserve a small ring of callback descriptors from the async callback stack area.
++            constexpr uint32_t kPoolSlots = 256u;
++            constexpr uint32_t kPoolBytes = kPoolSlots * kMpegCallbackDataSize;
++            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++            static uint32_t s_cbDataPoolBase = 0u;
++            static uint32_t s_cbDataPoolCursor = 0u;
++            if (s_cbDataPoolBase == 0u)
++            {
++                const uint32_t top = runtime->reserveAsyncCallbackStack(kPoolBytes, 16u);
++                if (top < kPoolBytes)
++                {
++                    return 0u;
++                }
++                s_cbDataPoolBase = top - kPoolBytes;
++            }
++            const uint32_t slot = s_cbDataPoolCursor++ % kPoolSlots;
++            return s_cbDataPoolBase + slot * kMpegCallbackDataSize;
++        }
++
++        void appendGuestStreamCallbackInvocation(uint8_t *rdram,
++                                                 R5900Context *callerCtx,
++                                                 PS2Runtime *runtime,
++                                                 const MpegStreamCallbackEvent &event,
++                                                 const MpegRegisteredCallback &callback,
++                                                 std::vector<GuestInvocation> &outInvocations)
+         {
+             if (!rdram || !callerCtx || !runtime || callback.func == 0u || !runtime->hasFunction(callback.func))
+             {
+                 return;
+             }
+ 
+-            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
++            bool fromHeap = false;
++            const uint32_t cbDataAddr = allocateMpegCallbackData(runtime, fromHeap);
+             if (cbDataAddr == 0u)
+             {
+                 return;
+             }
+             if (!writeMpegCallbackData(rdram, cbDataAddr, event))
+             {
+-                runtime->guestFree(cbDataAddr);
++                if (fromHeap)
++                {
++                    runtime->guestFree(cbDataAddr);
++                }
+                 return;
+             }
+ 
+@@ -1613,11 +1651,14 @@ namespace ps2_stubs
+             GuestInvocation invocation{};
+             invocation.kind = GuestInvocationKind::RpcCallback;
+             invocation.context = callbackCtx;
+-            invocation.onComplete = [runtime, cbDataAddr](const R5900Context &, R5900Context &)
++            if (fromHeap)
+             {
+-                runtime->guestFree(cbDataAddr);
+-            };
+-            runtime->eeScheduler().queueInvocation(std::move(invocation));
++                invocation.onComplete = [runtime, cbDataAddr](const R5900Context &, R5900Context &)
++                {
++                    runtime->guestFree(cbDataAddr);
++                };
++            }
++            outInvocations.push_back(std::move(invocation));
+         }
+ 
+         void dispatchStreamCallbacks(uint8_t *rdram,
+@@ -1625,18 +1666,30 @@ namespace ps2_stubs
+                                      PS2Runtime *runtime,
+                                      const std::vector<MpegStreamCallbackEvent> &events)
+         {
+-            if (events.empty())
++            if (events.empty() || !runtime)
+             {
+                 return;
+             }
+ 
++            std::vector<GuestInvocation> invocations;
++            invocations.reserve(events.size());
+             for (const MpegStreamCallbackEvent &event : events)
+             {
+                 for (const MpegRegisteredCallback &callback : event.callbacks)
+                 {
+-                    dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback);
++                    appendGuestStreamCallbackInvocation(rdram, ctx, runtime, event, callback, invocations);
+                 }
+             }
++
++            if (invocations.empty())
++            {
++                return;
++            }
++
++            // Execute stream callbacks synchronously on the current thread before returning
++            // to the demux caller, matching real sceMpegDemuxPssRing semantics so the guest
++            // ring buffer cannot be overwritten before callbacks copy their payloads.
++            runtime->eeScheduler().invokeCurrentSequence(std::move(invocations));
+         }
+ 
+         void dispatchStreamCallbacksUnlocked(uint8_t *rdram,
+@@ -2141,8 +2194,8 @@ namespace ps2_stubs
+             });
+         }
+ 
+-        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+         setReturnS32(ctx, static_cast<int32_t>(consumed));
++        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+     }
+ 
+     void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -2235,8 +2288,8 @@ namespace ps2_stubs
+             });
+         }
+ 
+-        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+         setReturnS32(ctx, static_cast<int32_t>(consumed));
++        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+     }
+ 
+     void sceMpegDispCenterOffX(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
