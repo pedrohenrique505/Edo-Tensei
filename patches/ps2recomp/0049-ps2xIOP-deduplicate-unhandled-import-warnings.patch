@@ -1,0 +1,57 @@
+From: Edo-Tensei <edo-tensei@local>
+Subject: [PATCH] ps2xIOP: deduplicate unhandled import warnings per (library, ordinal)
+
+Modules such as SNDBASE.IRX invoke missing imports on every audio tick,
+flooding stderr with duplicate `[IOP] unhandled import` lines. Track already
+logged `(library, ordinal)` pairs in `IopEmulator::Impl` and clear the set on
+`reset()` so each missing import is reported once per boot.
+---
+ ps2xIOP/src/emulator/iop_emulator.cpp | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -20,6 +20,7 @@
+ #include <algorithm>
+ #include <cctype>
+ #include <map>
+ #include <optional>
++#include <set>
+ #include <span>
+ #include <sstream>
+ #include <utility>
+@@ -126,6 +127,7 @@ namespace ps2x::iop::detail
+             ioman.reset();
+             pendingDmaInterrupts.clear();
+             pendingGuestCallbacks.clear();
++            loggedUnhandledImports.clear();
+             nextModuleId = 1;
+             moduleCursor = kModuleLoadBase;
+             totalCycles = 0;
+@@ -361,10 +363,13 @@ namespace ps2x::iop::detail
+                 return ImportDisposition::JumpToGuest;
+             }
+ 
+-            std::ostringstream out;
+-            out << "[IOP] unhandled import " << call.library << ':' << call.ordinal
+-                << " version=0x" << std::hex << call.version << " pc=0x" << cpu.pc;
+-            log(LogLevel::Warning, out.str());
++            if (loggedUnhandledImports.emplace(call.library, call.ordinal).second)
++            {
++                std::ostringstream out;
++                out << "[IOP] unhandled import " << call.library << ':' << call.ordinal
++                    << " version=0x" << std::hex << call.version << " pc=0x" << cpu.pc;
++                log(LogLevel::Warning, out.str());
++            }
+             setV0(0);
+             return ImportDisposition::Missing;
+         }
+@@ -708,6 +713,7 @@ namespace ps2x::iop::detail
+         std::map<int, Module> modules;
+         std::map<int, uint64_t> pendingDmaInterrupts;
+         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
++        std::set<std::pair<std::string, uint16_t>> loggedUnhandledImports;
+         uint32_t nextModuleId = 1;
+         uint32_t moduleCursor = kModuleLoadBase;
+         uint64_t totalCycles = 0;
