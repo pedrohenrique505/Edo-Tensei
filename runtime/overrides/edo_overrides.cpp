@@ -11,6 +11,7 @@
 #include "ps2_iop_transport.h"
 #include "ps2_runtime_calls.h"
 #include "ps2_stubs.h"
+#include "Stubs/CD.h"
 #include "ps2_syscalls.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_memory.h"
@@ -211,6 +212,7 @@ namespace
                     std::memcpy(dst + 4, &it->second.size, 4);
                     const size_t ncopy = std::min<size_t>(it->second.name.size(), 15);
                     std::memcpy(dst + 8, it->second.name.data(), ncopy);
+                    ps2_stubs::registerCdIsoRange(norm, it->second.lsn, it->second.size);
                     std::fprintf(stderr, "[edo:cd] search \"%s\" -> lsn=0x%X size=0x%X\n",
                                  raw.c_str(), it->second.lsn, it->second.size);
                     setReturnS32(ctx, 1);

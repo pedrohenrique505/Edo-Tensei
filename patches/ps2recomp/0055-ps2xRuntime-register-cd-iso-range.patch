@@ -1,0 +1,48 @@
+diff --git i/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp w/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 56a978e..9366f4f 100644
+--- i/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ w/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -169,6 +169,15 @@ namespace ps2_stubs
+         }
+     }
+ 
++    void registerCdIsoRange(const std::string &key, uint32_t baseLbn, uint32_t sizeBytes)
++    {
++        CdFileEntry entry{};
++        entry.baseLbn = baseLbn;
++        entry.sizeBytes = sizeBytes;
++        entry.sectors = std::max<uint32_t>(1u, (sizeBytes + kCdSectorSize - 1u) / kCdSectorSize);
++        g_cdFilesByKey[key] = std::move(entry);
++    }
++
+     CdDebugSnapshot getCdDebugSnapshot()
+     {
+         CdDebugSnapshot snapshot{};
+diff --git i/ps2xRuntime/src/lib/Kernel/Stubs/CD.h w/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
+index dd5bae9..68d576e 100644
+--- i/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
++++ w/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
+@@ -47,6 +47,8 @@ namespace ps2_stubs
+     void sceCdRM(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdApplyNCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdBreak(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++    void registerCdIsoRange(const std::string &key, uint32_t baseLbn, uint32_t sizeBytes);
++
+     void sceCdCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdDelayThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+diff --git i/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h w/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index b1bb6d8..25d8e4f 100644
+--- i/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ w/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -436,6 +436,10 @@ namespace
+     {
+         for (const auto &[key, entry] : g_cdFilesByKey)
+         {
++            if (entry.hostPath.empty())
++            {
++                continue;
++            }
+             const uint32_t endLbn = entry.baseLbn + entry.sectors;
+             if (lbn < entry.baseLbn || lbn >= endLbn)
+             {
