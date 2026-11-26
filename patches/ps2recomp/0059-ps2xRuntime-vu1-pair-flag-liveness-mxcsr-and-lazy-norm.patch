@@ -1,0 +1,961 @@
+diff --git i/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp w/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index fdd130e..a459851 100644
+--- i/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ w/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -21,6 +21,9 @@
+ #include <filesystem>
+ #include <limits>
+ #include <ps2_log.h>
++#if defined(__SSE__) || defined(__x86_64__) || defined(_M_X64)
++#include <xmmintrin.h>
++#endif
+ 
+ using Ps2Vu1NativeFn = bool (*)(uint64_t codeHash, VU1State &st, uint8_t *vuData, uint32_t dataSize,
+                                 GS &gs, PS2Memory *memory, uint64_t *outGifHash, uint64_t *outGifBytes, bool replaySink);
+@@ -51,8 +54,11 @@ namespace
+         uint32_t viWrite = 0;
+         uint32_t accWrite = 0;
+         bool programReadsFmacFlags = true;
++        bool programReadsStatusFlags = true;
++        bool currentPairNeedsFlags = true;
+         uint64_t codeHash = 0;
+         const void *activeDecodedPairs = nullptr;
++        const uint8_t *activePairFlags = nullptr;
+     };
+ 
+     uint64_t hashVuCodeBytes(const uint8_t *vuCode, uint32_t codeSize) noexcept
+@@ -154,12 +160,17 @@ void VU1Interpreter::resetScheduler()
+     m_accWritePipeline = {};
+     auto &masks = activeMasksFor(this);
+     const bool keepFmacFlags = masks.programReadsFmacFlags;
++    const bool keepStatusFlags = masks.programReadsStatusFlags;
+     const uint64_t keepCodeHash = masks.codeHash;
+     const auto *keepDecodedPairs = masks.activeDecodedPairs;
++    const auto *keepPairFlags = masks.activePairFlags;
+     masks = {};
+     masks.programReadsFmacFlags = keepFmacFlags;
++    masks.programReadsStatusFlags = keepStatusFlags;
++    masks.currentPairNeedsFlags = keepFmacFlags;
+     masks.codeHash = keepCodeHash;
+     masks.activeDecodedPairs = keepDecodedPairs;
++    masks.activePairFlags = keepPairFlags;
+     m_xgkick.sourceAddress = 0;
+     m_xgkick.totalBytes = 0;
+     m_xgkick.copiedBytes = 0;
+@@ -656,7 +667,8 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+ 
+ void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
+ {
+-    if (!activeMasksFor(this).programReadsFmacFlags)
++    const auto &masks = activeMasksFor(this);
++    if (!masks.currentPairNeedsFlags)
+     {
+         for (uint32_t c = 0; c < 4u; ++c)
+         {
+@@ -681,13 +693,15 @@ void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
+     }
+     uint8_t laneFlags[4]{};
+     normalizeFmacResult(result, dest, laneFlags);
+-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
++    const uint32_t extraSticky = masks.programReadsStatusFlags ? calculateFmacProductSticky(dest) : 0u;
++    updateFmacFlags(laneFlags, dest, extraSticky);
+     applyDest(dst, result, dest);
+ }
+ 
+ void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
+ {
+-    if (!activeMasksFor(this).programReadsFmacFlags)
++    const auto &masks = activeMasksFor(this);
++    if (!masks.currentPairNeedsFlags)
+     {
+         for (uint32_t c = 0; c < 4u; ++c)
+         {
+@@ -712,7 +726,8 @@ void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
+     }
+     uint8_t laneFlags[4]{};
+     normalizeFmacResult(result, dest, laneFlags);
+-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
++    const uint32_t extraSticky = masks.programReadsStatusFlags ? calculateFmacProductSticky(dest) : 0u;
++    updateFmacFlags(laneFlags, dest, extraSticky);
+     applyDestAcc(result, dest);
+ }
+ 
+@@ -1803,6 +1818,77 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+     const uint64_t codeHash = hashVuCodeBytes(vuCode, codeSize);
+     auto &masks = activeMasksFor(this);
+ 
++    auto computePairFlags = [&](const DecodedInstructionPair *pairs, uint8_t *pairFlags,
++                                bool &outReadsFmac, bool &outReadsStatus) {
++        bool readsStatus = false;
++        bool readsMac = false;
++        for (uint32_t i = 0; i < pairCount; ++i)
++        {
++            const auto &pair = pairs[i];
++            if (!pair.iBit)
++            {
++                const uint32_t top = (pair.lower >> 25) & 0x7Fu;
++                if (top == 0x14u || top == 0x16u || top == 0x17u || top == 0x18u)
++                    readsStatus = true;
++                else if (top == 0x1Au || top == 0x1Bu || top == 0x1Du)
++                    readsMac = true;
++            }
++        }
++        outReadsStatus = readsStatus;
++        outReadsFmac = readsStatus || readsMac;
++        if (readsStatus)
++        {
++            std::memset(pairFlags, 1, pairCount);
++            return;
++        }
++        std::memset(pairFlags, 0, pairCount);
++        if (!readsMac)
++            return;
++
++        auto markWindow = [&](uint32_t endIdx, uint32_t window) {
++            const uint32_t start = (endIdx > window) ? (endIdx - window) : 0u;
++            for (uint32_t k = start; k <= endIdx && k < pairCount; ++k)
++                pairFlags[k] = 1u;
++        };
++
++        for (uint32_t i = 0; i < pairCount; ++i)
++        {
++            const auto &pair = pairs[i];
++            if (!pair.iBit)
++            {
++                const uint32_t top = (pair.lower >> 25) & 0x7Fu;
++                if (top == 0x1Au || top == 0x1Bu || top == 0x1Du)
++                {
++                    markWindow(i, 8u);
++                }
++            }
++        }
++        // Propagate conservatively across branches whose target is inside a MAC-flag window,
++        // and across indirect jumps (JR/JALR).
++        for (uint32_t i = 0; i < pairCount; ++i)
++        {
++            const auto &pair = pairs[i];
++            if (pair.iBit)
++                continue;
++            const uint32_t top = (pair.lower >> 25) & 0x7Fu;
++            if (top == 0x24u || top == 0x25u) // JR / JALR
++            {
++                markWindow(std::min<uint32_t>(pairCount - 1u, i + 1u), 9u);
++            }
++            else if (top == 0x20u || top == 0x21u || (top >= 0x28u && top <= 0x2Fu))
++            {
++                int32_t imm11 = static_cast<int32_t>(pair.lower & 0x7FFu);
++                if (imm11 & 0x400)
++                    imm11 -= 0x800;
++                const int32_t target = static_cast<int32_t>(i) + 1 + imm11;
++                if (target >= 0 && static_cast<uint32_t>(target) < pairCount && pairFlags[target])
++                {
++                    markWindow(std::min<uint32_t>(pairCount - 1u, i + 1u), 9u);
++                }
++            }
++        }
++    };
++
+     if (m_unit == Unit::VU1 && !vuReplaySink)
+     {
+         struct Vu1DecodedProgramSlot
+@@ -1812,7 +1898,9 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+             uint64_t lruStamp = 0;
+             bool valid = false;
+             bool readsFmacFlags = true;
++            bool readsStatusFlags = true;
+             std::array<DecodedInstructionPair, kMaxDecodedPairs> pairs{};
++            std::array<uint8_t, kMaxDecodedPairs> pairFlags{};
+         };
+         static constexpr size_t kVu1ProgramCacheSlots = 8;
+         static std::array<Vu1DecodedProgramSlot, kVu1ProgramCacheSlots> s_cache{};
+@@ -1835,8 +1923,11 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+         {
+             hit->lruStamp = ++s_lruClock;
+             masks.programReadsFmacFlags = hit->readsFmacFlags;
++            masks.programReadsStatusFlags = hit->readsStatusFlags;
++            masks.currentPairNeedsFlags = hit->readsFmacFlags;
+             masks.codeHash = codeHash;
+             masks.activeDecodedPairs = hit->pairs.data();
++            masks.activePairFlags = hit->pairFlags.data();
+             m_cachedVuCode = vuCode;
+             m_cachedMemory = memory;
+             m_cachedCodeSize = codeSize;
+@@ -1845,30 +1936,23 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+             return;
+         }
+ 
+-        bool readsFmacFlags = false;
+         for (uint32_t i = 0; i < pairCount; ++i)
+         {
+-            const DecodedInstructionPair pair = decodeInstructionPair(vuCode, i * 8u);
+-            victim->pairs[i] = pair;
+-            if (!pair.iBit)
+-            {
+-                const uint32_t top = (pair.lower >> 25) & 0x7Fu;
+-                if (top == 0x14u || top == 0x16u || top == 0x17u ||
+-                    top == 0x18u || top == 0x1Au || top == 0x1Bu || top == 0x1Du)
+-                {
+-                    readsFmacFlags = true;
+-                }
+-            }
++            victim->pairs[i] = decodeInstructionPair(vuCode, i * 8u);
+         }
++        computePairFlags(victim->pairs.data(), victim->pairFlags.data(),
++                         victim->readsFmacFlags, victim->readsStatusFlags);
+         victim->codeHash = codeHash;
+         victim->codeSize = codeSize;
+         victim->lruStamp = ++s_lruClock;
+-        victim->readsFmacFlags = readsFmacFlags;
+         victim->valid = true;
+ 
+-        masks.programReadsFmacFlags = readsFmacFlags;
++        masks.programReadsFmacFlags = victim->readsFmacFlags;
++        masks.programReadsStatusFlags = victim->readsStatusFlags;
++        masks.currentPairNeedsFlags = victim->readsFmacFlags;
+         masks.codeHash = codeHash;
+         masks.activeDecodedPairs = victim->pairs.data();
++        masks.activePairFlags = victim->pairFlags.data();
+         m_cachedVuCode = vuCode;
+         m_cachedMemory = memory;
+         m_cachedCodeSize = codeSize;
+@@ -1877,24 +1961,20 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+         return;
+     }
+ 
+-    bool readsFmacFlags = false;
++    static std::array<uint8_t, kMaxDecodedPairs> s_fallbackFlags{};
+     for (uint32_t i = 0; i < pairCount; ++i)
+     {
+-        const DecodedInstructionPair pair = decodeInstructionPair(vuCode, i * 8u);
+-        m_decodedCodeCache[i] = pair;
+-        if (!pair.iBit)
+-        {
+-            const uint32_t top = (pair.lower >> 25) & 0x7Fu;
+-            if (top == 0x14u || top == 0x16u || top == 0x17u ||
+-                top == 0x18u || top == 0x1Au || top == 0x1Bu || top == 0x1Du)
+-            {
+-                readsFmacFlags = true;
+-            }
+-        }
++        m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+     }
++    bool readsFmacFlags = false;
++    bool readsStatusFlags = false;
++    computePairFlags(m_decodedCodeCache.data(), s_fallbackFlags.data(), readsFmacFlags, readsStatusFlags);
+     masks.programReadsFmacFlags = readsFmacFlags;
++    masks.programReadsStatusFlags = readsStatusFlags;
++    masks.currentPairNeedsFlags = readsFmacFlags;
+     masks.codeHash = codeHash;
+     masks.activeDecodedPairs = m_decodedCodeCache.data();
++    masks.activePairFlags = s_fallbackFlags.data();
+ 
+     m_cachedVuCode = vuCode;
+     m_cachedMemory = memory;
+@@ -2012,8 +2092,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     m_activeGs = &gs;
+     m_activeMemory = memory;
+ 
++#if defined(__SSE__) || defined(__x86_64__) || defined(_M_X64)
++    const unsigned int previousMxcsr = _mm_getcsr();
++    _mm_setcsr((previousMxcsr & ~0x6000u) | 0x6000u);
++    auto restoreRounding = [previousMxcsr]() noexcept { _mm_setcsr(previousMxcsr); };
++#else
+     const int previousRoundingMode = std::fegetround();
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
++    auto restoreRounding = [useVuRounding, previousRoundingMode]() {
++        if (useVuRounding && previousRoundingMode != -1)
++            std::fesetround(previousRoundingMode);
++    };
++#endif
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
+ 
+@@ -2060,8 +2150,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                                 wantObserve ? &vuGifBytes : nullptr,
+                                 vuReplaySink))
+         {
+-            if (useVuRounding && previousRoundingMode != -1)
+-                std::fesetround(previousRoundingMode);
++            restoreRounding();
+             return;
+         }
+     }
+@@ -2070,16 +2159,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         (fastCodeCache && masks.activeDecodedPairs)
+             ? static_cast<const DecodedInstructionPair *>(masks.activeDecodedPairs)
+             : m_decodedCodeCache.data();
++    const uint8_t *activeFlags = (fastCodeCache && masks.activePairFlags) ? masks.activePairFlags : nullptr;
+     DecodedInstructionPair fallbackDecoded{};
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
++        const bool useFastPair = fastCodeCache && (m_state.pc & 7u) == 0u && (m_state.pc >> 3) < kMaxDecodedPairs;
++        const uint32_t pairIdx = m_state.pc >> 3;
+         const DecodedInstructionPair &decoded =
+-            (fastCodeCache && (m_state.pc & 7u) == 0u && (m_state.pc >> 3) < kMaxDecodedPairs)
+-                ? activePairs[m_state.pc >> 3]
+-                : (fallbackDecoded = decodeInstructionPair(vuCode, m_state.pc));
++            useFastPair ? activePairs[pairIdx] : (fallbackDecoded = decodeInstructionPair(vuCode, m_state.pc));
++        masks.currentPairNeedsFlags = (useFastPair && activeFlags) ? (activeFlags[pairIdx] != 0u) : masks.programReadsFmacFlags;
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+         {
+             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+@@ -2256,8 +2347,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (!out)
+             throw std::runtime_error("VU capture write failed");
+     }
+-    if (useVuRounding && previousRoundingMode != -1)
+-        std::fesetround(previousRoundingMode);
++    restoreRounding();
+ }
+ 
+ int VU1Interpreter::replayCapture(const char *path)
+diff --git i/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp w/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+index 11172f1..1c7f043 100644
+--- i/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
++++ w/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+@@ -63,33 +63,14 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     uint8_t fd = FD(instr);
+ 
+     float *vd = m_state.vf[fd];
+-    const bool minMax = (op >= 0x10u && op <= 0x17u) ||
+-                        op == 0x1Du || op == 0x1Fu || op == 0x2Bu || op == 0x2Fu;
+-    float normalizedVs[4];
+-    float normalizedVt[4];
+-    float normalizedAcc[4];
+-    if (minMax)
+-    {
+-        for (uint32_t component = 0; component < 4u; ++component)
+-        {
+-            normalizedVs[component] = m_state.vf[fs][component];
+-            normalizedVt[component] = m_state.vf[ft][component];
+-        }
+-    }
+-    else
+-    {
+-        for (uint32_t component = 0; component < 4u; ++component)
+-        {
+-            normalizedVs[component] = fastNormalizeOperand(m_state.vf[fs][component]);
+-            normalizedVt[component] = fastNormalizeOperand(m_state.vf[ft][component]);
+-            normalizedAcc[component] = fastNormalizeOperand(m_state.acc[component]);
+-        }
+-    }
+-    const float *vs = normalizedVs;
+-    const float *vt = normalizedVt;
+-    const float *acc = normalizedAcc;
+-    const float q = fastNormalizeOperand(m_state.q);
+-    const float i = minMax ? m_state.i : fastNormalizeOperand(m_state.i);
++    const float *rawVs = m_state.vf[fs];
++    const float *rawVt = m_state.vf[ft];
++    const float *rawAcc = m_state.acc;
++    auto normVs = [&](int c) noexcept { return fastNormalizeOperand(rawVs[c]); };
++    auto normVt = [&](int c) noexcept { return fastNormalizeOperand(rawVt[c]); };
++    auto normAcc = [&](int c) noexcept { return fastNormalizeOperand(rawAcc[c]); };
++    auto normQ = [&]() noexcept { return fastNormalizeOperand(m_state.q); };
++    auto normI = [&]() noexcept { return fastNormalizeOperand(m_state.i); };
+     float result[4];
+ 
+     // Upper opcode decoding (bits 5:0 of upper word)
+@@ -100,9 +81,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x02:
+     case 0x03: // ADDbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = normVt(op & 3);
+         for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] + bc;
++            if (dest & (8u >> c))
++                result[c] = normVs(c) + bc;
+         applyFmacDest(vd, result, dest);
+         return;
+     }
+@@ -111,9 +93,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x06:
+     case 0x07: // SUBbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = normVt(op & 3);
+         for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] - bc;
++            if (dest & (8u >> c))
++                result[c] = normVs(c) - bc;
+         applyFmacDest(vd, result, dest);
+         return;
+     }
+@@ -122,9 +105,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x0A:
+     case 0x0B: // MADDbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = normVt(op & 3);
+         for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] + vs[c] * bc;
++            if (dest & (8u >> c))
++                result[c] = normAcc(c) + normVs(c) * bc;
+         applyFmacDest(vd, result, dest);
+         return;
+     }
+@@ -133,9 +117,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x0E:
+     case 0x0F: // MSUBbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = normVt(op & 3);
+         for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] - vs[c] * bc;
++            if (dest & (8u >> c))
++                result[c] = normAcc(c) - normVs(c) * bc;
+         applyFmacDest(vd, result, dest);
+         return;
+     }
+@@ -144,9 +129,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x12:
+     case 0x13: // MAXbc
+     {
+-        float bc = vt[op & 3];
++        float bc = rawVt[op & 3];
+         for (int c = 0; c < 4; c++)
+-            result[c] = vuMinMax(vs[c], bc, true);
++            if (dest & (8u >> c))
++                result[c] = vuMinMax(rawVs[c], bc, true);
+         applyDest(vd, result, dest);
+         return;
+     }
+@@ -155,9 +141,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x16:
+     case 0x17: // MINIbc
+     {
+-        float bc = vt[op & 3];
++        float bc = rawVt[op & 3];
+         for (int c = 0; c < 4; c++)
+-            result[c] = vuMinMax(vs[c], bc, false);
++            if (dest & (8u >> c))
++                result[c] = vuMinMax(rawVs[c], bc, false);
+         applyDest(vd, result, dest);
+         return;
+     }
+@@ -166,112 +153,162 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     case 0x1A:
+     case 0x1B: // MULbc
+     {
+-        float bc = broadcast(vt, op & 3);
++        float bc = normVt(op & 3);
+         for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] * bc;
++            if (dest & (8u >> c))
++                result[c] = normVs(c) * bc;
+         applyFmacDest(vd, result, dest);
+         return;
+     }
+     case 0x1C: // MULq
++    {
++        float q = normQ();
+         for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] * q;
++            if (dest & (8u >> c))
++                result[c] = normVs(c) * q;
+         applyFmacDest(vd, result, dest);
+         return;
++    }
+     case 0x1D: // MAXi
+         for (int c = 0; c < 4; c++)
+-            result[c] = vuMinMax(vs[c], i, true);
++            if (dest & (8u >> c))
++                result[c] = vuMinMax(rawVs[c], m_state.i, true);
+         applyDest(vd, result, dest);
+         return;
+     case 0x1E: // MULi
++    {
++        float i = normI();
+         for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] * i;
++            if (dest & (8u >> c))
++                result[c] = normVs(c) * i;
+         applyFmacDest(vd, result, dest);
+         return;
++    }
+     case 0x1F: // MINIi
+         for (int c = 0; c < 4; c++)
+-            result[c] = vuMinMax(vs[c], i, false);
++            if (dest & (8u >> c))
++                result[c] = vuMinMax(rawVs[c], m_state.i, false);
+         applyDest(vd, result, dest);
+         return;
+     case 0x20: // ADDq
++    {
++        float q = normQ();
+         for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] + q;
++            if (dest & (8u >> c))
++                result[c] = normVs(c) + q;
+         applyFmacDest(vd, result, dest);
+         return;
++    }
+     case 0x21: // MADDq
++    {
++        float q = normQ();
+         for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] + vs[c] * q;
++            if (dest & (8u >> c))
++                result[c] = normAcc(c) + normVs(c) * q;
+         applyFmacDest(vd, result, dest);
+         return;
++    }
+     case 0x22: // ADDi
++    {
++        float i = normI();
+         for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] + i;
++            if (dest & (8u >> c))
++                result[c] = normVs(c) + i;
+         applyFmacDest(vd, result, dest);
+         return;
++    }
+     case 0x23: // MADDi
++    {
++        float i = normI();
+         for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] + vs[c] * i;
++            if (dest & (8u >> c))
++                result[c] = normAcc(c) + normVs(c) * i;
+         applyFmacDest(vd, result, dest);
+         return;
++    }
+     case 0x24: // SUBq
++    {
++        float q = normQ();
+         for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] - q;
++            if (dest & (8u >> c))
++                result[c] = normVs(c) - q;
+         applyFmacDest(vd, result, dest);
+         return;
++    }
+     case 0x25: // MSUBq
++    {
++        float q = normQ();
+         for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] - vs[c] * q;
++            if (dest & (8u >> c))
++                result[c] = normAcc(c) - normVs(c) * q;
+         applyFmacDest(vd, result, dest);
+         return;
++    }
+     case 0x26: // SUBi
++    {
++        float i = normI();
+         for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] - i;
++            if (dest & (8u >> c))
++                result[c] = normVs(c) - i;
+         applyFmacDest(vd, result, dest);
+         return;
++    }
+     case 0x27: // MSUBi
++    {
++        float i = normI();
+         for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] - vs[c] * i;
++            if (dest & (8u >> c))
++                result[c] = normAcc(c) - normVs(c) * i;
+         applyFmacDest(vd, result, dest);
+         return;
++    }
+     case 0x28: // ADD
+         for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] + vt[c];
++            if (dest & (8u >> c))
++                result[c] = normVs(c) + normVt(c);
+         applyFmacDest(vd, result, dest);
+         return;
+     case 0x29: // MADD
+         for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] + vs[c] * vt[c];
++            if (dest & (8u >> c))
++                result[c] = normAcc(c) + normVs(c) * normVt(c);
+         applyFmacDest(vd, result, dest);
+         return;
+     case 0x2A: // MUL
+         for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] * vt[c];
++            if (dest & (8u >> c))
++                result[c] = normVs(c) * normVt(c);
+         applyFmacDest(vd, result, dest);
+         return;
+     case 0x2B: // MAX
+         for (int c = 0; c < 4; c++)
+-            result[c] = vuMinMax(vs[c], vt[c], true);
++            if (dest & (8u >> c))
++                result[c] = vuMinMax(rawVs[c], rawVt[c], true);
+         applyDest(vd, result, dest);
+         return;
+     case 0x2C: // SUB
+         for (int c = 0; c < 4; c++)
+-            result[c] = vs[c] - vt[c];
++            if (dest & (8u >> c))
++                result[c] = normVs(c) - normVt(c);
+         applyFmacDest(vd, result, dest);
+         return;
+     case 0x2D: // MSUB
+         for (int c = 0; c < 4; c++)
+-            result[c] = acc[c] - vs[c] * vt[c];
++            if (dest & (8u >> c))
++                result[c] = normAcc(c) - normVs(c) * normVt(c);
+         applyFmacDest(vd, result, dest);
+         return;
+     case 0x2E: // OPMSUB
+-        result[0] = acc[0] - vs[1] * vt[2];
+-        result[1] = acc[1] - vs[2] * vt[0];
+-        result[2] = acc[2] - vs[0] * vt[1];
++        result[0] = normAcc(0) - normVs(1) * normVt(2);
++        result[1] = normAcc(1) - normVs(2) * normVt(0);
++        result[2] = normAcc(2) - normVs(0) * normVt(1);
+         result[3] = 0.0f;
+         applyFmacDest(vd, result, dest);
+         return;
+     case 0x2F: // MINI
+         for (int c = 0; c < 4; c++)
+-            result[c] = vuMinMax(vs[c], vt[c], false);
++            if (dest & (8u >> c))
++                result[c] = vuMinMax(rawVs[c], rawVt[c], false);
+         applyDest(vd, result, dest);
+         return;
+ 
+@@ -294,9 +331,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         case 0x02:
+         case 0x03: // ADDAbc
+         {
+-            float bc = broadcast(vt, specialOp & 3);
++            float bc = normVt(specialOp & 3);
+             for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] + bc;
++                if (dest & (8u >> c))
++                    result[c] = normVs(c) + bc;
+             applyFmacDestAcc(result, dest);
+             return;
+         }
+@@ -305,9 +343,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         case 0x06:
+         case 0x07: // SUBAbc
+         {
+-            float bc = broadcast(vt, specialOp & 3);
++            float bc = normVt(specialOp & 3);
+             for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] - bc;
++                if (dest & (8u >> c))
++                    result[c] = normVs(c) - bc;
+             applyFmacDestAcc(result, dest);
+             return;
+         }
+@@ -316,9 +355,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         case 0x0A:
+         case 0x0B: // MADDAbc
+         {
+-            float bc = broadcast(vt, specialOp & 3);
++            float bc = normVt(specialOp & 3);
+             for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] + vs[c] * bc;
++                if (dest & (8u >> c))
++                    result[c] = normAcc(c) + normVs(c) * bc;
+             applyFmacDestAcc(result, dest);
+             return;
+         }
+@@ -327,78 +367,87 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         case 0x0E:
+         case 0x0F: // MSUBAbc
+         {
+-            float bc = broadcast(vt, specialOp & 3);
++            float bc = normVt(specialOp & 3);
+             for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] - vs[c] * bc;
++                if (dest & (8u >> c))
++                    result[c] = normAcc(c) - normVs(c) * bc;
+             applyFmacDestAcc(result, dest);
+             return;
+         }
+         case 0x10: // ITOF0
+             for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv;
+-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
+-                result[c] = static_cast<float>(iv);
+-            }
++                if (dest & (8u >> c))
++                {
++                    int32_t iv;
++                    std::memcpy(&iv, &rawVs[c], 4);
++                    result[c] = static_cast<float>(iv);
++                }
+             applyDest(vtDest, result, dest);
+             return;
+         case 0x11: // ITOF4
+             for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv;
+-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
+-                result[c] = static_cast<float>(iv) / 16.0f;
+-            }
++                if (dest & (8u >> c))
++                {
++                    int32_t iv;
++                    std::memcpy(&iv, &rawVs[c], 4);
++                    result[c] = static_cast<float>(iv) * (1.0f / 16.0f);
++                }
+             applyDest(vtDest, result, dest);
+             return;
+         case 0x12: // ITOF12
+             for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv;
+-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
+-                result[c] = static_cast<float>(iv) / 4096.0f;
+-            }
++                if (dest & (8u >> c))
++                {
++                    int32_t iv;
++                    std::memcpy(&iv, &rawVs[c], 4);
++                    result[c] = static_cast<float>(iv) * (1.0f / 4096.0f);
++                }
+             applyDest(vtDest, result, dest);
+             return;
+         case 0x13: // ITOF15
+             for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv;
+-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
+-                result[c] = static_cast<float>(iv) / 32768.0f;
+-            }
++                if (dest & (8u >> c))
++                {
++                    int32_t iv;
++                    std::memcpy(&iv, &rawVs[c], 4);
++                    result[c] = static_cast<float>(iv) * (1.0f / 32768.0f);
++                }
+             applyDest(vtDest, result, dest);
+             return;
+         case 0x14: // FTOI0
+             for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = vuFloatToInt(vs[c], 1.0f);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
++                if (dest & (8u >> c))
++                {
++                    int32_t iv = vuFloatToInt(normVs(c), 1.0f);
++                    std::memcpy(&result[c], &iv, 4);
++                }
+             applyDest(vtDest, result, dest);
+             return;
+         case 0x15: // FTOI4
+             for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = vuFloatToInt(vs[c], 16.0f);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
++                if (dest & (8u >> c))
++                {
++                    int32_t iv = vuFloatToInt(normVs(c), 16.0f);
++                    std::memcpy(&result[c], &iv, 4);
++                }
+             applyDest(vtDest, result, dest);
+             return;
+         case 0x16: // FTOI12
+             for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = vuFloatToInt(vs[c], 4096.0f);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
++                if (dest & (8u >> c))
++                {
++                    int32_t iv = vuFloatToInt(normVs(c), 4096.0f);
++                    std::memcpy(&result[c], &iv, 4);
++                }
+             applyDest(vtDest, result, dest);
+             return;
+         case 0x17: // FTOI15
+             for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = vuFloatToInt(vs[c], 32768.0f);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
++                if (dest & (8u >> c))
++                {
++                    int32_t iv = vuFloatToInt(normVs(c), 32768.0f);
++                    std::memcpy(&result[c], &iv, 4);
++                }
+             applyDest(vtDest, result, dest);
+             return;
+         case 0x18:
+@@ -406,27 +455,37 @@ void VU1Interpreter::execUpper(uint32_t instr)
+         case 0x1A:
+         case 0x1B: // MULAbc
+         {
+-            float bc = broadcast(vt, specialOp & 3);
++            float bc = normVt(specialOp & 3);
+             for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] * bc;
++                if (dest & (8u >> c))
++                    result[c] = normVs(c) * bc;
+             applyFmacDestAcc(result, dest);
+             return;
+         }
+         case 0x1C: // MULAq
++        {
++            float q = normQ();
+             for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] * q;
++                if (dest & (8u >> c))
++                    result[c] = normVs(c) * q;
+             applyFmacDestAcc(result, dest);
+             return;
++        }
+         case 0x1D: // ABS
+             for (int c = 0; c < 4; c++)
+-                result[c] = std::fabs(vs[c]);
++                if (dest & (8u >> c))
++                    result[c] = std::fabs(normVs(c));
+             applyDest(vtDest, result, dest);
+             return;
+         case 0x1E: // MULAi
++        {
++            float i = normI();
+             for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] * i;
++                if (dest & (8u >> c))
++                    result[c] = normVs(c) * i;
+             applyFmacDestAcc(result, dest);
+             return;
++        }
+         case 0x1F: // CLIP
+         {
+             uint32_t wBits = 0u;
+@@ -460,74 +519,111 @@ void VU1Interpreter::execUpper(uint32_t instr)
+             return;
+         }
+         case 0x20: // ADDAq
++        {
++            float q = normQ();
+             for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] + q;
++                if (dest & (8u >> c))
++                    result[c] = normVs(c) + q;
+             applyFmacDestAcc(result, dest);
+             return;
++        }
+         case 0x21: // MADDAq
++        {
++            float q = normQ();
+             for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] + vs[c] * q;
++                if (dest & (8u >> c))
++                    result[c] = normAcc(c) + normVs(c) * q;
+             applyFmacDestAcc(result, dest);
+             return;
++        }
+         case 0x22: // ADDAi
++        {
++            float i = normI();
+             for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] + i;
++                if (dest & (8u >> c))
++                    result[c] = normVs(c) + i;
+             applyFmacDestAcc(result, dest);
+             return;
++        }
+         case 0x23: // MADDAi
++        {
++            float i = normI();
+             for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] + vs[c] * i;
++                if (dest & (8u >> c))
++                    result[c] = normAcc(c) + normVs(c) * i;
+             applyFmacDestAcc(result, dest);
+             return;
++        }
+         case 0x24: // SUBAq
++        {
++            float q = normQ();
+             for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] - q;
++                if (dest & (8u >> c))
++                    result[c] = normVs(c) - q;
+             applyFmacDestAcc(result, dest);
+             return;
++        }
+         case 0x25: // MSUBAq
++        {
++            float q = normQ();
+             for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] - vs[c] * q;
++                if (dest & (8u >> c))
++                    result[c] = normAcc(c) - normVs(c) * q;
+             applyFmacDestAcc(result, dest);
+             return;
++        }
+         case 0x26: // SUBAi
++        {
++            float i = normI();
+             for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] - i;
++                if (dest & (8u >> c))
++                    result[c] = normVs(c) - i;
+             applyFmacDestAcc(result, dest);
+             return;
++        }
+         case 0x27: // MSUBAi
++        {
++            float i = normI();
+             for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] - vs[c] * i;
++                if (dest & (8u >> c))
++                    result[c] = normAcc(c) - normVs(c) * i;
+             applyFmacDestAcc(result, dest);
+             return;
++        }
+         case 0x28: // ADDA
+             for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] + vt[c];
++                if (dest & (8u >> c))
++                    result[c] = normVs(c) + normVt(c);
+             applyFmacDestAcc(result, dest);
+             return;
+         case 0x29: // MADDA
+             for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] + vs[c] * vt[c];
++                if (dest & (8u >> c))
++                    result[c] = normAcc(c) + normVs(c) * normVt(c);
+             applyFmacDestAcc(result, dest);
+             return;
+         case 0x2A: // MULA
+             for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] * vt[c];
++                if (dest & (8u >> c))
++                    result[c] = normVs(c) * normVt(c);
+             applyFmacDestAcc(result, dest);
+             return;
+         case 0x2C: // SUBA
+             for (int c = 0; c < 4; c++)
+-                result[c] = vs[c] - vt[c];
++                if (dest & (8u >> c))
++                    result[c] = normVs(c) - normVt(c);
+             applyFmacDestAcc(result, dest);
+             return;
+         case 0x2D: // MSUBA
+             for (int c = 0; c < 4; c++)
+-                result[c] = acc[c] - vs[c] * vt[c];
++                if (dest & (8u >> c))
++                    result[c] = normAcc(c) - normVs(c) * normVt(c);
+             applyFmacDestAcc(result, dest);
+             return;
+         case 0x2E: // OPMULA
+-            result[0] = vs[1] * vt[2];
+-            result[1] = vs[2] * vt[0];
+-            result[2] = vs[0] * vt[1];
++            result[0] = normVs(1) * normVt(2);
++            result[1] = normVs(2) * normVt(0);
++            result[2] = normVs(0) * normVt(1);
+             result[3] = 0.0f;
+             applyFmacDestAcc(result, dest);
+             return;
