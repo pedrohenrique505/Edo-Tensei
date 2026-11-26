@@ -661,6 +661,66 @@ namespace
         runtime.replaceFunction(0x001629E8u, sifCallRpcTraced);
         runtime.replaceFunction(0x001733C0u, cdLayerSearchFile);
 
+        if (const char *tm = std::getenv("EDO_TRACE_MENU"); tm && *tm && *tm != '0')
+        {
+            runtime.replaceFunction(0x00396B90u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int frames = 0;
+                static auto lastFrame = std::chrono::steady_clock::now();
+                const auto t0 = std::chrono::steady_clock::now();
+                const uint32_t obj = getRegU32(c, 4);
+                FUN_00396b90_0x396b90(r, c, rt);
+                const auto t1 = std::chrono::steady_clock::now();
+                ++frames;
+                const auto dtMs = std::chrono::duration_cast<std::chrono::microseconds>(t0 - lastFrame).count() / 1000.0;
+                const auto updUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+                lastFrame = t0;
+                if (frames <= 120 || (frames % 10) == 0)
+                {
+                    int32_t st = -1, sel = -1;
+                    float anim = 0.0f;
+                    if (const uint8_t *p = getConstMemPtr(r, obj))
+                    {
+                        std::memcpy(&st, p + 0x00u, 4);
+                        std::memcpy(&sel, p + 0x24u, 4);
+                        std::memcpy(&anim, p + 0x28u, 4);
+                    }
+                    std::fprintf(stderr, "[edo:menu] f=%d dt=%.2fms upd=%lldus st=%d sel=%d anim=%.3f\n",
+                                 frames, dtMs, static_cast<long long>(updUs), st, sel, anim);
+                    std::fflush(stderr);
+                }
+            });
+            runtime.replaceFunction(0x003972E0u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                static int frames = 0;
+                const auto t0 = std::chrono::steady_clock::now();
+                FUN_003972e0_0x3972e0(r, c, rt);
+                const auto drawUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - t0)
+                                        .count();
+                if (++frames <= 120 || (frames % 10) == 0)
+                {
+                    std::fprintf(stderr, "[edo:menu] draw f=%d %lldus\n", frames, static_cast<long long>(drawUs));
+                    std::fflush(stderr);
+                }
+            });
+            runtime.replaceFunction(0x00108600u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+                const uint32_t menuObj = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617D10u));
+                const auto t0 = std::chrono::steady_clock::now();
+                FUN_00108600_0x108600(r, c, rt);
+                if (menuObj)
+                {
+                    static int f = 0;
+                    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - t0)
+                                        .count();
+                    if (++f <= 120 || (f % 10) == 0)
+                    {
+                        std::fprintf(stderr, "[edo:menu] swap/108600 f=%d %lldus\n", f, static_cast<long long>(us));
+                        std::fflush(stderr);
+                    }
+                }
+            });
+        }
+
         if (const char *tf = std::getenv("EDO_TRACE_FMV"); tf && *tf && *tf != '0')
         {
             runtime.replaceFunction(0x001E1390u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
@@ -797,10 +857,64 @@ namespace
                     const char *v = std::getenv("EDO_AUTO_PRESS");
                     if (!v || !*v || *v == '0')
                         return 0;
-                    return (std::strcmp(v, "boot") == 0) ? 2 : 1;
+                    if (std::strcmp(v, "boot") == 0)
+                        return 2;
+                    if (std::strcmp(v, "menu") == 0)
+                        return 3;
+                    return 1;
                 }();
                 static int n = 0;
                 ++n;
+                if (autoPressMode == 3)
+                {
+                    const uint32_t sysPtr = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617EF0u - 0x3F4u));
+                    uint32_t *padEdge = sysPtr ? reinterpret_cast<uint32_t *>(getMemPtr(r, sysPtr + 0x84u)) : nullptr;
+                    if (!padEdge)
+                        return;
+                    const uint32_t gameStatePtr = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617EF0u - 0x230u));
+                    const int32_t gameState = gameStatePtr ? *reinterpret_cast<const int32_t *>(getConstMemPtr(r, gameStatePtr)) : 0;
+                    if (gameState == 3)
+                    {
+                        // Tela de titulo (FUN_001e4480): se estiver em s0==4 e selecao==1 (Load Game),
+                        // aperta Up (0x1000) para ir para New Game (0) antes de confirmar.
+                        const uint32_t titleObj = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617CC4u));
+                        if (titleObj)
+                        {
+                            const int32_t s0 = *reinterpret_cast<const int32_t *>(getConstMemPtr(r, titleObj));
+                            const int32_t sel = *reinterpret_cast<const int32_t *>(getConstMemPtr(r, titleObj + 0x0Cu));
+                            if (s0 == 1 && (n % 20) == 0)
+                            {
+                                *padEdge |= 0x840u;
+                            }
+                            else if (s0 == 4 && (n % 20) == 0)
+                            {
+                                *padEdge |= (sel != 0) ? 0x1000u : 0x0040u;
+                            }
+                        }
+                    }
+                    else if (gameState == 4)
+                    {
+                        // No menu principal (iRam00617d10 != 0), navega entre opcoes periodicamente se pedido.
+                        const uint32_t menuObj = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617D10u));
+                        if (menuObj)
+                        {
+                            static int menuFrames = 0;
+                            ++menuFrames;
+                            if (menuFrames == 30 || menuFrames == 60 || menuFrames == 90)
+                            {
+                                // Right (0x2000) ou Down (0x4000) para trocar de opcao no carrossel
+                                *padEdge |= 0x2000u;
+                                std::fprintf(stderr, "[edo:menu] auto-press Right em menuFrames=%d\n", menuFrames);
+                                std::fflush(stderr);
+                            }
+                        }
+                    }
+                    else if (n >= 90 && (n % 30) == 0)
+                    {
+                        *padEdge |= 0x840u;
+                    }
+                    return;
+                }
                 const bool allowPress = (autoPressMode == 1) || (autoPressMode == 2 && n <= 420);
                 if (allowPress && n >= 90 && (n % 60) == 0) {
                     const uint32_t sysPtr = *reinterpret_cast<const uint32_t *>(getConstMemPtr(r, 0x617EF0u - 0x3F4u));
