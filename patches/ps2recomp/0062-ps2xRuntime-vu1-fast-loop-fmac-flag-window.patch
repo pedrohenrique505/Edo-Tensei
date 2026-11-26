@@ -1,0 +1,18 @@
+From: Edo Tensei <edo-tensei@local>
+Subject: [PATCH] ps2xRuntime: manter flags FMAC ativas no loop rapido VU1 quando o programa le flags
+
+Evita falso negativo da janela curta de 8 pares (activeFlags) quando ha
+branch entre a instrucao FMAC e o FMAND que le as flags MAC (ex: culling
+cel-shaded no menu principal).
+
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -2249,7 +2249,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                 reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+                 break;
+             }
+-            masks.currentPairNeedsFlags = activeFlags ? (activeFlags[pairIdx] != 0u) : masks.programReadsFmacFlags;
++            masks.currentPairNeedsFlags = masks.programReadsFmacFlags;
+ 
+             uint64_t readyCycle = calculatePairReadyCycle(decoded);
+             while (readyCycle > m_cycle)
