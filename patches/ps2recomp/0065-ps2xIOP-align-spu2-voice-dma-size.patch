@@ -1,0 +1,46 @@
+diff --git a/ps2xIOP/src/emulator/imports/iop_libsd.cpp b/ps2xIOP/src/emulator/imports/iop_libsd.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_libsd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_libsd.cpp
+@@ -469,22 +469,32 @@
+                 return true;
+             }
+ 
+-            if (size != 0u && sAddr < kSpu2RamSize)
+-            {
+-                const uint32_t clampedSize = std::min(size, kSpu2RamSize - sAddr);
+-                if (dir == 0u) // SD_TRANS_MODE_WRITE: IOP RAM -> SPU2 RAM
++            // This libsd ABI reports the total number of 64-byte DMA blocks
++            // transferred, in bytes, including the final partial block.
++            constexpr uint32_t kDmaBlockSize = 64u;
++            const uint64_t transferSize = (static_cast<uint64_t>(size) + kDmaBlockSize - 1u) &
++                                          ~static_cast<uint64_t>(kDmaBlockSize - 1u);
++            if (dir > 1u || transferSize > kSpu2RamSize - sAddr)
++            {
++                setV0(-1u);
++                return true;
++            }
++            if (transferSize != 0u)
++            {
++                uint8_t *spuData = m_spu2Ram.data() + sAddr;
++                const bool ok = dir == 0u
++                    ? m_memory.readRam(mAddr, spuData, transferSize)
++                    : m_memory.writeRam(mAddr, spuData, transferSize);
++                if (!ok)
+                 {
+-                    (void)m_memory.readRam(mAddr, m_spu2Ram.data() + sAddr, clampedSize);
+-                }
+-                else if (dir == 1u) // SD_TRANS_MODE_READ: SPU2 RAM -> IOP RAM
+-                {
+-                    (void)m_memory.writeRam(mAddr, m_spu2Ram.data() + sAddr, clampedSize);
++                    setV0(-1u);
++                    return true;
+                 }
+             }
+ 
+             m_dma[ch].voiceTransPending = true;
+             m_dma[ch].voiceTransDoneCycle = currentCycle + kVoiceTransDelayCycles;
+-            setV0(size);
++            setV0(static_cast<uint32_t>(transferSize));
+             return true;
+         }
+ 
