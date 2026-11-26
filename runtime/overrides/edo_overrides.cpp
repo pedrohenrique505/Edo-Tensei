@@ -374,6 +374,41 @@ namespace
         ctx->pc = getRegU32(ctx, 31);
     }
 
+    // 0x00726550 (overlay BTL): ponto de entrada de FUN_00726568 chamado por
+    // FUN_003827f0 (0x00382804) no ELF principal. O Ghidra exportou apenas o
+    // corpo do loop (0x00726560 / 0x00726568), omitindo o prólogo em 0x00726550.
+    void ovlBtlFunc00726550(uint8_t *rdram, R5900Context *ctx, PS2Runtime * /*runtime*/)
+    {
+        const uint32_t a0 = getRegU32(ctx, 4);
+        int32_t count = 0;
+        uint32_t lastA1 = getRegU32(ctx, 5);
+        for (int32_t a2 = 0; a2 < 3; ++a2)
+        {
+            const uint32_t ptrAddr = a0 + static_cast<uint32_t>(a2) * 4u;
+            const uint8_t *pEntry = getConstMemPtr(rdram, ptrAddr);
+            if (!pEntry)
+                break;
+            uint32_t a1 = 0;
+            std::memcpy(&a1, pEntry, 4);
+            lastA1 = a1;
+            const uint8_t *obj = getConstMemPtr(rdram, a1);
+            if (!obj)
+                continue;
+            const uint8_t b0 = obj[0];
+            if (b0 == 0u)
+                continue;
+            uint32_t w4 = 0;
+            std::memcpy(&w4, obj + 4, 4);
+            if (w4 != 0u)
+                ++count;
+        }
+        SET_GPR_S32(ctx, 2, count);
+        SET_GPR_S32(ctx, 3, 0);
+        SET_GPR_S32(ctx, 5, static_cast<int32_t>(lastA1));
+        SET_GPR_S32(ctx, 6, 3);
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
     // 0x00100270: ativacao de overlay MWo3 chamada por FUN_001c3150(slot, filename).
     // Troca os entrypoints do overlay ativo na g_sparseFunctionTable ANTES de
     // FUN_00100270 zerar o .bss e executar os construtores estaticos (.ctors) via FUN_0011a0b0.
@@ -415,6 +450,10 @@ namespace
 
         if (activeEntries != nullptr)
         {
+            if (activeId == 1u)
+            {
+                runtime->replaceFunction(0x00726550u, nullptr);
+            }
             for (size_t i = 0; i < activeCount; ++i)
             {
                 runtime->replaceFunction(activeEntries[i].address, nullptr);
@@ -429,6 +468,10 @@ namespace
             for (size_t i = 0; i < nextCount; ++i)
             {
                 runtime->registerFunction(nextEntries[i].address, nextEntries[i].fn);
+            }
+            if (overlayId == 1u)
+            {
+                runtime->registerFunction(0x00726550u, &ovlBtlFunc00726550);
             }
             activeEntries = nextEntries;
             activeCount = nextCount;
