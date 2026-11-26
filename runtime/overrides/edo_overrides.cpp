@@ -660,6 +660,35 @@ namespace
         runtime.replaceFunction(0x00162808u, sifBindRpcBlocking);
         runtime.replaceFunction(0x001629E8u, sifCallRpcTraced);
         runtime.replaceFunction(0x001733C0u, cdLayerSearchFile);
+        runtime.replaceFunction(0x0017A610u, [](uint8_t *r, R5900Context *c, PS2Runtime *rt) {
+            // FUN_00118ca0 tenta alocar 0x016CD6F0 bytes (contando com EndOfHeap() == 0x01FF8000
+            // no PS2 real, o que deixaria ~8 KiB livres no sbrk). Como o PS2Recomp limita o heap
+            // em 0x01F00000 para reservar pilhas de callbacks assincronos, o fallback guloso
+            // (`while (!p) size -= 0x100`) consome 100% do sbrk e deixa < 256 bytes para a newlib.
+            // Ao entrar na luta livre (BTL), strtod/Balloc recebe NULL de _malloc_r e entra em
+            // loop infinito em FUN_0017bcc0 (lshift). Preservamos 64 KiB no sbrk para a newlib.
+            const uint32_t ra = getRegU32(c, 31);
+            if (ra == 0x00118D3Cu || ra == 0x00118D58u)
+            {
+                const uint32_t reqSize = getRegU32(c, 4);
+                const uint32_t heapLimit = rt ? rt->guestHeapLimit() : 0x01F00000u;
+                uint32_t sbrkPtr = 0u;
+                if (const uint8_t *p = getConstMemPtr(r, 0x0040F774u))
+                {
+                    std::memcpy(&sbrkPtr, p, sizeof(sbrkPtr));
+                }
+                constexpr uint64_t kNewlibHeapReserve = 0x10000u; // 64 KiB para newlib/Balloc
+                if (sbrkPtr != 0u &&
+                    static_cast<uint64_t>(sbrkPtr) + static_cast<uint64_t>(reqSize) + kNewlibHeapReserve >
+                        static_cast<uint64_t>(heapLimit))
+                {
+                    setReturnU32(c, 0u);
+                    c->pc = ra;
+                    return;
+                }
+            }
+            FUN_0017a610_0x17a610(r, c, rt);
+        });
 
         if (const char *tm = std::getenv("EDO_TRACE_MENU"); tm && *tm && *tm != '0')
         {
