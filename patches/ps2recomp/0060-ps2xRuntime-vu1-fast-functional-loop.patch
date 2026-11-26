@@ -1,5 +1,5 @@
 diff --git i/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp w/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index a459851..7792c8a 100644
+index a459851..6e8cd56 100644
 --- i/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ w/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -56,6 +56,7 @@ namespace
@@ -133,7 +133,7 @@ index a459851..7792c8a 100644
                  {
                      markWindow(i, 8u);
                  }
-@@ -2160,6 +2227,171 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -2160,6 +2227,176 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              ? static_cast<const DecodedInstructionPair *>(masks.activeDecodedPairs)
              : m_decodedCodeCache.data();
      const uint8_t *activeFlags = (fastCodeCache && masks.activePairFlags) ? masks.activePairFlags : nullptr;
@@ -161,25 +161,28 @@ index a459851..7792c8a 100644
 +            }
 +            masks.currentPairNeedsFlags = activeFlags ? (activeFlags[pairIdx] != 0u) : false;
 +
-+            if (m_fdiv.valid && (decoded.lowerUsage.waitQ || decoded.lowerUsage.pipeline == PipelineFdiv))
++            uint64_t readyCycle = calculatePairReadyCycle(decoded);
++            while (readyCycle > m_cycle)
 +            {
-+                m_state.q = m_fdiv.value;
-+                const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
-+                m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
-+                m_fdiv.valid = false;
-+            }
-+            if (masks.efu && (decoded.lowerUsage.waitP || decoded.lowerUsage.pipeline == PipelineEfu))
-+            {
-+                uint32_t em = masks.efu;
-+                while (em)
++                m_viBranchBackupValid = false;
++                if (readyCycle >= budgetEnd)
 +                {
-+                    const uint32_t idx = static_cast<uint32_t>(std::countr_zero(em));
-+                    em &= em - 1u;
-+                    m_state.p = m_efu[idx].value;
-+                    m_efu[idx].valid = false;
++                    advanceTo(budgetEnd);
++                    break;
 +                }
-+                masks.efu = 0u;
++                if (!hasAnyPending())
++                {
++                    m_cycle = readyCycle;
++                    m_state.cycles = m_cycle;
++                }
++                else
++                {
++                    advanceTo(readyCycle);
++                }
++                readyCycle = calculatePairReadyCycle(decoded);
 +            }
++            if (m_cycle >= budgetEnd)
++                break;
 +
 +            uint8_t writtenVi = 0u;
 +            int32_t oldVi = 0;
@@ -232,6 +235,8 @@ index a459851..7792c8a 100644
 +            m_state.vf[0][2] = 0.0f;
 +            m_state.vf[0][3] = 1.0f;
 +            m_state.vi[0] = 0;
++
++            markPairWrites(decoded);
 +
 +            if (m_xgkick.active)
 +            {
@@ -305,7 +310,7 @@ index a459851..7792c8a 100644
      DecodedInstructionPair fallbackDecoded{};
      while (m_cycle < budgetEnd && !m_stopRequested)
      {
-@@ -2319,6 +2551,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -2319,6 +2556,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          if (programEnded)
              break;
      }
