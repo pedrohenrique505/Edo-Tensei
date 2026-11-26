@@ -1,0 +1,315 @@
+diff --git i/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp w/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index a459851..7792c8a 100644
+--- i/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ w/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -56,6 +56,7 @@ namespace
+         bool programReadsFmacFlags = true;
+         bool programReadsStatusFlags = true;
+         bool currentPairNeedsFlags = true;
++        bool fastMode = false;
+         uint64_t codeHash = 0;
+         const void *activeDecodedPairs = nullptr;
+         const uint8_t *activePairFlags = nullptr;
+@@ -691,6 +692,37 @@ void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
+         applyDest(dst, result, dest);
+         return;
+     }
++    if (masks.fastMode)
++    {
++        uint8_t laneFlags[4]{};
++        for (uint32_t c = 0; c < 4u; ++c)
++        {
++            if ((dest & laneForComponent(c)) == 0u)
++                continue;
++            uint32_t bits = 0;
++            std::memcpy(&bits, &result[c], sizeof(bits));
++            const uint32_t exp = (bits >> 23) & 0xFFu;
++            uint8_t fl = (bits & 0x80000000u) ? 0x2u : 0x0u;
++            if (exp == 0u)
++            {
++                if ((bits & 0x007FFFFFu) != 0u)
++                    fl |= 0x4u;
++                fl |= 0x1u;
++                bits &= 0x80000000u;
++                std::memcpy(&result[c], &bits, sizeof(bits));
++            }
++            else if (exp == 0xFFu)
++            {
++                fl |= 0x8u;
++                bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++                std::memcpy(&result[c], &bits, sizeof(bits));
++            }
++            laneFlags[c] = fl;
++        }
++        updateFmacFlags(laneFlags, dest, 0u);
++        applyDest(dst, result, dest);
++        return;
++    }
+     uint8_t laneFlags[4]{};
+     normalizeFmacResult(result, dest, laneFlags);
+     const uint32_t extraSticky = masks.programReadsStatusFlags ? calculateFmacProductSticky(dest) : 0u;
+@@ -724,6 +756,37 @@ void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
+         applyDestAcc(result, dest);
+         return;
+     }
++    if (masks.fastMode)
++    {
++        uint8_t laneFlags[4]{};
++        for (uint32_t c = 0; c < 4u; ++c)
++        {
++            if ((dest & laneForComponent(c)) == 0u)
++                continue;
++            uint32_t bits = 0;
++            std::memcpy(&bits, &result[c], sizeof(bits));
++            const uint32_t exp = (bits >> 23) & 0xFFu;
++            uint8_t fl = (bits & 0x80000000u) ? 0x2u : 0x0u;
++            if (exp == 0u)
++            {
++                if ((bits & 0x007FFFFFu) != 0u)
++                    fl |= 0x4u;
++                fl |= 0x1u;
++                bits &= 0x80000000u;
++                std::memcpy(&result[c], &bits, sizeof(bits));
++            }
++            else if (exp == 0xFFu)
++            {
++                fl |= 0x8u;
++                bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++                std::memcpy(&result[c], &bits, sizeof(bits));
++            }
++            laneFlags[c] = fl;
++        }
++        updateFmacFlags(laneFlags, dest, 0u);
++        applyDestAcc(result, dest);
++        return;
++    }
+     uint8_t laneFlags[4]{};
+     normalizeFmacResult(result, dest, laneFlags);
+     const uint32_t extraSticky = masks.programReadsStatusFlags ? calculateFmacProductSticky(dest) : 0u;
+@@ -1103,10 +1166,18 @@ void VU1Interpreter::progressXgkick()
+         }
+ 
+         const uint32_t qwordOffset = m_xgkick.copiedBytes;
+-        for (uint32_t i = 0; i < 16u; ++i)
++        const uint32_t srcOff = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) & (m_activeVuDataSize - 1u);
++        if (srcOff + 16u <= m_activeVuDataSize)
+         {
+-            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
+-            m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
++            std::memcpy(m_xgkick.packet.data() + qwordOffset, m_activeVuData + srcOff, 16u);
++        }
++        else
++        {
++            for (uint32_t i = 0; i < 16u; ++i)
++            {
++                const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
++                m_xgkick.packet[qwordOffset + i] = m_activeVuData[source];
++            }
+         }
+         m_xgkick.copiedBytes += 16u;
+ 
+@@ -1836,13 +1907,8 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+         }
+         outReadsStatus = readsStatus;
+         outReadsFmac = readsStatus || readsMac;
+-        if (readsStatus)
+-        {
+-            std::memset(pairFlags, 1, pairCount);
+-            return;
+-        }
+         std::memset(pairFlags, 0, pairCount);
+-        if (!readsMac)
++        if (!outReadsFmac)
+             return;
+ 
+         auto markWindow = [&](uint32_t endIdx, uint32_t window) {
+@@ -1857,7 +1923,8 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+             if (!pair.iBit)
+             {
+                 const uint32_t top = (pair.lower >> 25) & 0x7Fu;
+-                if (top == 0x1Au || top == 0x1Bu || top == 0x1Du)
++                if (top == 0x1Au || top == 0x1Bu || top == 0x1Du ||
++                    top == 0x16u || top == 0x17u)
+                 {
+                     markWindow(i, 8u);
+                 }
+@@ -2160,6 +2227,171 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             ? static_cast<const DecodedInstructionPair *>(masks.activeDecodedPairs)
+             : m_decodedCodeCache.data();
+     const uint8_t *activeFlags = (fastCodeCache && masks.activePairFlags) ? masks.activePairFlags : nullptr;
++    static const bool forceAccurate = [] {
++        const char *v = std::getenv("PS2X_VU1_ACCURATE");
++        return v && *v && *v != '0';
++    }();
++    const bool useFastLoop = (m_unit == Unit::VU1 && !vuObserve() && !captured &&
++                              !forceAccurate && fastCodeCache && !m_xgkick.active && !hasAnyPending());
++    masks.fastMode = useFastLoop;
++
++    if (useFastLoop)
++    {
++        while (m_cycle < budgetEnd && !m_stopRequested)
++        {
++            if (m_state.pc + 8u > codeSize)
++                break;
++
++            const uint32_t pairIdx = m_state.pc >> 3;
++            const DecodedInstructionPair &decoded = activePairs[pairIdx];
++            if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
++            {
++                reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
++                break;
++            }
++            masks.currentPairNeedsFlags = activeFlags ? (activeFlags[pairIdx] != 0u) : false;
++
++            if (m_fdiv.valid && (decoded.lowerUsage.waitQ || decoded.lowerUsage.pipeline == PipelineFdiv))
++            {
++                m_state.q = m_fdiv.value;
++                const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
++                m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
++                m_fdiv.valid = false;
++            }
++            if (masks.efu && (decoded.lowerUsage.waitP || decoded.lowerUsage.pipeline == PipelineEfu))
++            {
++                uint32_t em = masks.efu;
++                while (em)
++                {
++                    const uint32_t idx = static_cast<uint32_t>(std::countr_zero(em));
++                    em &= em - 1u;
++                    m_state.p = m_efu[idx].value;
++                    m_efu[idx].valid = false;
++                }
++                masks.efu = 0u;
++            }
++
++            uint8_t writtenVi = 0u;
++            int32_t oldVi = 0;
++            const uint32_t viWriteMask = decoded.lowerUsage.viWrite & ~1u;
++            if (viWriteMask != 0u)
++            {
++                writtenVi = static_cast<uint8_t>(std::countr_zero(viWriteMask));
++                oldVi = m_state.vi[writtenVi];
++            }
++
++            const bool upperIsNop = (decoded.upper & 0x7FFu) == 0x2FFu;
++            if (decoded.iBit)
++            {
++                if (!upperIsNop)
++                    execUpper(decoded.upper);
++                float immediate = 0.0f;
++                std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
++                m_state.i = immediate;
++            }
++            else if (decoded.upperVfShadowReg != 0u)
++            {
++                float oldVf[4]{};
++                float upperVf[4]{};
++                std::memcpy(oldVf, m_state.vf[decoded.upperVfShadowReg], sizeof(oldVf));
++                if (!upperIsNop)
++                    execUpper(decoded.upper);
++                std::memcpy(upperVf, m_state.vf[decoded.upperVfShadowReg], sizeof(upperVf));
++                std::memcpy(m_state.vf[decoded.upperVfShadowReg], oldVf, sizeof(oldVf));
++                execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++                std::memcpy(m_state.vf[decoded.upperVfShadowReg], upperVf, sizeof(upperVf));
++            }
++            else
++            {
++                if (!upperIsNop)
++                    execUpper(decoded.upper);
++                if (decoded.lower != 0x8000033Cu)
++                    execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
++            }
++
++            m_viBranchBackupValid = false;
++            if (viWriteMask != 0u)
++            {
++                m_viBranchBackupReg = writtenVi;
++                m_viBranchBackupValue = oldVi;
++                m_viBranchBackupValid = true;
++            }
++
++            m_state.vf[0][0] = 0.0f;
++            m_state.vf[0][1] = 0.0f;
++            m_state.vf[0][2] = 0.0f;
++            m_state.vf[0][3] = 1.0f;
++            m_state.vi[0] = 0;
++
++            if (m_xgkick.active)
++            {
++                while (m_xgkick.active)
++                {
++                    m_xgkick.cycleCredit = 2u;
++                    progressXgkick();
++                }
++            }
++
++            const bool delaySlot = m_state.ebit;
++            const bool haltDelaySlot = m_state.haltAfterDelaySlot;
++            const bool dHalt = decoded.dBit && (m_unit == Unit::VU0 ? memory != nullptr : true);
++            const bool tHalt = decoded.tBit;
++            const bool haltNow = !decoded.eBit && (dHalt || tHalt);
++            const bool haltBranch = haltNow && m_state.branchPending && m_state.branchDelay == 1;
++
++            if (m_state.branchPending)
++            {
++                if (m_state.branchDelay > 0)
++                {
++                    m_state.branchDelay--;
++                    m_state.pc = (m_state.pc + 8u) & microAddressMask();
++                }
++                else
++                {
++                    m_state.pc = m_state.branchTarget & microAddressMask();
++                    m_state.branchPending = false;
++                }
++            }
++            else
++            {
++                m_state.pc = (m_state.pc + 8u) & microAddressMask();
++            }
++
++            if (delaySlot)
++            {
++                programEnded = true;
++            }
++            else if (haltDelaySlot)
++            {
++                m_state.stoppedByD = m_pendingHaltD;
++                m_state.stoppedByT = m_pendingHaltT;
++                programEnded = true;
++            }
++            else if (haltNow && !haltBranch)
++            {
++                m_state.stoppedByD = dHalt;
++                m_state.stoppedByT = tHalt;
++                programEnded = true;
++            }
++            else if (decoded.eBit)
++                m_state.ebit = true;
++            else if (haltBranch)
++            {
++                m_state.haltAfterDelaySlot = true;
++                m_pendingHaltD = dHalt;
++                m_pendingHaltT = tHalt;
++            }
++
++            ++m_cycle;
++            if (hasAnyPending())
++                commitReadyPipelines();
++            if (programEnded)
++                break;
++        }
++        masks.fastMode = false;
++    }
++    else
++    {
+     DecodedInstructionPair fallbackDecoded{};
+     while (m_cycle < budgetEnd && !m_stopRequested)
+     {
+@@ -2319,6 +2551,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (programEnded)
+             break;
+     }
++    }
+ 
+     if (programEnded)
+     {
