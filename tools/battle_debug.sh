@@ -19,6 +19,12 @@ Comandos:
   snapshot [--bad-only] [file] Exibe o dump de structs/memoria (Camera, P1, P2 e --watch)
   jsonl [opcoes] [file]        Filtra eventos do events.jsonl
   diff <reportA> <reportB>     Compara dois relatorios (antes vs depois de um fix)
+  check [opcoes]               Gate de regressao: roda replay e sai 0 (PASS) ou 1 (FAIL)
+
+Opcoes (check):
+  --baseline FILE              Compara contra um report.txt de referencia (falha se houver novos pontos ou aumento)
+  --max-anomalies N            Limite maximo de anomalias quando sem --baseline (padrao: 0)
+  (aceita tambem todas as opcoes de replay, ex: --stop-after, --host-math, --out-dir)
 
 Opcoes (replay / run):
   --out-dir DIR                Diretorio de saida (padrao: .cache/battle-debug)
@@ -289,6 +295,73 @@ for k in resolved:
 print(f"\nNEW sites ({len(added)}):")
 for k in added:
     print(f"  + [{k[0]}] {k[1]}({k[2]}) ra={k[3]} (now x{aB[k][0]} @ f={aB[k][1]})")
+PY
+        ;;
+
+    check)
+        baseline=""
+        max_anoms=0
+        check_out="$DEFAULT_OUT"
+        replay_args=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --baseline) baseline="$2"; shift 2 ;;
+                --max-anomalies) max_anoms="$2"; shift 2 ;;
+                --out-dir) check_out="$2"; replay_args+=("$1" "$2"); shift 2 ;;
+                -h|--help) usage; exit 0 ;;
+                *) replay_args+=("$1"); shift ;;
+            esac
+        done
+        "$0" replay "${replay_args[@]}"
+        report_path="$check_out/report.txt"
+        if [[ ! -s "$report_path" ]]; then
+            echo "[battle-debug:check] FAIL: report.txt ausente em $report_path" >&2
+            exit 1
+        fi
+        python3 - "$report_path" "$baseline" "$max_anoms" <<'PY'
+import re, sys
+
+def parse(path):
+    meta = {}
+    anoms = {}
+    in_anom = False
+    for line in open(path, encoding="utf-8", errors="replace"):
+        if line.startswith("battleFrame="):
+            for kv in line.strip().split():
+                k, _, v = kv.partition("=")
+                meta[k] = v
+        elif line.startswith("--- ANOMALIES"):
+            in_anom = True
+        elif line.startswith("--- RECENT TRACE"):
+            in_anom = False
+        elif in_anom:
+            m = re.match(r"^\[#\d+\s+f=(\d+)\s+([A-Z]+)/([A-Z]+)\s+x(\d+)\]\s+fn=(0x[0-9A-Fa-f]+)\((.+?)\)\s+ra=(0x[0-9A-Fa-f]+)\s*\|\s*(.*)$", line.strip())
+            if m:
+                key = (m.group(2), m.group(5), m.group(6), m.group(7))
+                anoms[key] = int(m.group(4))
+    return meta, anoms
+
+report_path, baseline_path, max_anoms = sys.argv[1], sys.argv[2], int(sys.argv[3])
+mCurr, aCurr = parse(report_path)
+total = int(mCurr.get("totalAnomalies", "0"))
+if baseline_path:
+    mBase, aBase = parse(baseline_path)
+    base_total = int(mBase.get("totalAnomalies", "0"))
+    new_sites = sorted(set(aCurr) - set(aBase))
+    resolved = sorted(set(aBase) - set(aCurr))
+    print(f"[battle-debug:check] baseline={base_total} current={total} ({total - base_total:+d}) resolved={len(resolved)} new={len(new_sites)}")
+    if new_sites or total > base_total:
+        for k in new_sites:
+            print(f"  NEW: [{k[0]}] {k[1]}({k[2]}) ra={k[3]} (x{aCurr[k]})")
+        print("[battle-debug:check] FAIL: regressao detectada")
+        sys.exit(1)
+    print("[battle-debug:check] PASS")
+else:
+    print(f"[battle-debug:check] totalAnomalies={total} maxAllowed={max_anoms}")
+    if total > max_anoms:
+        print("[battle-debug:check] FAIL: acima do limite")
+        sys.exit(1)
+    print("[battle-debug:check] PASS")
 PY
         ;;
 

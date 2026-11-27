@@ -76,6 +76,11 @@ Compara dois arquivos `report.txt` (por exemplo, antes e depois de aplicar um pa
 - Lista pontos de anomalia **resolvidos** (`RESOLVED sites`, presentes em A e ausentes em B).
 - Lista pontos de anomalia **novos** (`NEW sites`, ausentes em A e presentes em B).
 
+### `check [--baseline reportA.txt] [--max-anomalies N] [opções de replay]`
+Gate de regressão automatizado: executa o `replay` e retorna `exit 0` (`PASS`) ou `exit 1` (`FAIL`):
+- Com `--baseline`: falha se surgir qualquer novo ponto de anomalia ou se `totalAnomalies` aumentar em relação ao baseline.
+- Sem `--baseline`: falha se `totalAnomalies > N` (padrão `N=0`).
+
 ---
 
 ## Opções de `replay` / `run` e Variáveis de Ambiente
@@ -91,10 +96,12 @@ Compara dois arquivos `report.txt` (por exemplo, antes e depois de aplicar um pa
 | `--watch SPEC` | `EDO_BATTLE_WATCH_MEM=SPEC` | Lista separada por vírgula de faixas `0xADDR:SIZE` da RDRAM para incluir no `snapshot.txt` (ex.: `0x00617EF0:0x40,0x00D68560:0x100`, máx. `0x1000` bytes por faixa). |
 | `--pad FILE` | `DRA2_PAD_REPLAY` | Arquivo de captura de controle usado no `replay` (padrão: `.cache/luta-livre/pad.txt`). |
 | `--no-math` | `EDO_BATTLE_MATH_CHECK=0` | Desativa o comparador diferencial de matemática (útil para isolar apenas câmera/colisão com overhead mínimo). |
+| `--host-math` | `EDO_BATTLE_HOST_MATH=1` | **Modo A/B:** mantém o registro de divergências, mas substitui o retorno das 8 funções soft-float `double` divergentes pelo valor IEEE-754 do host para isolar se bugs de câmera/colisão somem quando o soft-float está íntegro. |
 | `--break` | `EDO_BATTLE_BREAK=1` | Pausa automaticamente o loop da batalha ao registrar qualquer anomalia `ERROR` ou `CRIT` (use com a janela `F2` para `Resume` / `Step +1`). |
 | `--trace-camera` | `EDO_BATTLE_TRACE_CAMERA=1` | Registra `pos`, `tgt` e `shake` da câmera por frame no *ring buffer* e no `events.jsonl`. |
 | `--trace-fighters` | `EDO_BATTLE_TRACE_FIGHTERS=1` | Registra `P1`, `P2`, `delta` e `distP1P2` por frame no *ring buffer* e no `events.jsonl`. |
 | `--overlay-3d` | `EDO_BATTLE_OVERLAY_3D=1` | Ativa o overlay 3D→2D sobre o viewport desde o início (pode ser alternado também no painel `F2`). |
+| `--screenshot-on-anomaly` | `EDO_BATTLE_SCREENSHOT_DIR` | Salva quadros PPM (`first_anomaly_fN.ppm`, `visual_anomaly_fN.ppm` e `final_fN.ppm`) via `paraLLEl-GS` em `<out-dir>/screenshots/`. |
 | `--quiet` | `EDO_BATTLE_STDERR=0` | Suprime o eco das anomalias no `stderr`, gravando apenas em `report.txt` e `events.jsonl`. |
 | *(apenas env)* | `EDO_BATTLE_UI=1` | Abre a janela ImGui `Battle Debugger [F2]` automaticamente ao iniciar. |
 
@@ -134,9 +141,9 @@ Compara o retorno da função MIPS recompilada contra o equivalente nativo em C+
 ## Limitações Conhecidas
 
 1. **Escopo restrito ao overlay `BTL.BIN`:** a maioria dos watchdogs e todo o comparador matemático só atuam enquanto o overlay de batalha (`overlayId == 1`) está carregado. Bugs nos menus ou no modo Aventura (`ADV.BIN`) não são monitorados por padrão.
-2. **Contagem de `battleFrame`:** `m_battleFrame` incrementa a cada entrada em `ovl_btl_FUN_006e95f0`. Como o jogo atualiza cerca de 5 objetos de câmera por quadro visual (incluindo câmeras auxiliares sem `P1`/`P2`, como `0x00DB5510`), `battleFrame` avança ~5× mais rápido que os quadros de vídeo; os snapshots de `P1`/`P2` ignoram automaticamente câmeras auxiliares sem ponteiros de lutador.
+2. **Contagem de `battleFrame`:** `battleFrame` incrementa **1:1** com a câmera principal de batalha (a que possui ponteiros `P1`/`P2` em `+0x20/+0x24`, ex.: `0x00D68560`), ignorando as câmeras auxiliares sem lutadores.
 3. **Sensibilidade de timing no `replay`:** `.cache/luta-livre/pad.txt` reproduz inputs por tempo de relógio (*wall-clock*). Logs muito verbosos no `stderr` podem derrubar o FPS nos menus e desalinhar a navegação até a Luta Livre; se isso acontecer, use `--quiet` ou `--no-math`.
-4. **Anomalias raras por preempção/continuação:** o comparador matemático valida entrada e retorno no *wrapper* da função. Se o escalonador EE interromper uma função matemática no meio e retomar por continuação, podem surgir divergências isoladas (ex.: `1x` em `sinf`). Sempre verifique a contagem (`COUNT` no `top`) e o `CALLER_RA` antes de concluir que a função inteira está quebrada.
+4. **Preempção/continuações:** os hooks verificam `ctx->pc == ra` após o retorno e descartam chamadas interrompidas pelo escalonador EE (contabilizadas em `preemptedSkips`), evitando falsos positivos de retorno parcial. Cada anomalia também registra o mini-callstack dos hooks ativos (`stack`).
 5. **Cobertura de colisão:** os watchdogs de colisão atuais cobrem posições, deltas, limites de arena, distância `P1↔P2` e primitivas `dist2D_XY`/`dist3D_XYZ`. Volumes individuais de golpe/hurtbox (`ccBgAttackHit`, `ccWireHitModel`) e malhas triangulares de cenário ainda não estão mapeados nem desenhados no overlay 3D→2D.
 6. **Limites de retenção em memória:** o *ring buffer* guarda até `256` eventos de trace e `128` pontos únicos de anomalia por sessão; no `events.jsonl`, cada ponto único `(cat, fn, ra)` grava no máximo as primeiras `5` ocorrências para evitar arquivos gigantes em bugs a 60 FPS.
 7. **Dependência do overlay visual:** o painel `F2` e o overlay 3D→2D requerem build com `PS2X_ENABLE_DEBUG_UI=ON` (padrão atual em `build/`). O modo CLI (`report.txt`, `events.jsonl`, `snapshot.txt`) funciona independentemente da UI.

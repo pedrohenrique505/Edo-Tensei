@@ -19,16 +19,18 @@ Recompilação estática nativa de *Naruto Shippuden: Ultimate Ninja 5* (PAL `SL
 Para diagnosticar bugs de **câmera**, **colisão/física**, **matrizes**, **lutadores (`P1`/`P2`)**, **soft-float/matemática recompilada**, inspecionar **structs em RDRAM** ou validar correções antes/depois em lutas (`BTL.BIN`), use `tools/battle_debug.sh` e consulte [`docs/battle-debugger.md`](docs/battle-debugger.md) para a referência completa de comandos, flags, watchdogs e limitações.
 
 ```bash
-# Captura automatizada da Luta Livre com trace de lutadores e auto-stop
-tools/battle_debug.sh replay --trace-fighters --stop-after 95 --timeout 85
+# Captura automatizada da Luta Livre com trace de lutadores, screenshots e auto-stop
+tools/battle_debug.sh replay --trace-fighters --screenshot-on-anomaly --stop-after 30 --timeout 85
 
 # Triagem ranqueada, inspeção de structs e filtro JSONL
 tools/battle_debug.sh top
 tools/battle_debug.sh snapshot --bad-only
 tools/battle_debug.sh jsonl --cat MATH --limit 30
 
-# Comparar antes vs. depois de um fix
-tools/battle_debug.sh diff <reportA> <reportB>
+# Isolamento A/B (substitui soft-float double pelo host) e gate de regressão
+tools/battle_debug.sh replay --host-math --stop-after 30 --out-dir .cache/battle-debug-host
+tools/battle_debug.sh diff .cache/battle-debug/report.txt .cache/battle-debug-host/report.txt
+tools/battle_debug.sh check --baseline .cache/battle-debug/report.txt --stop-after 30
 ```
 
 No modo interativo (`tools/battle_debug.sh run --overlay-3d`), **`F2`** abre o painel ImGui do Battle Debugger (`F1` abre o Runtime Debugger).
