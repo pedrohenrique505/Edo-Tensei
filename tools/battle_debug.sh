@@ -92,6 +92,7 @@ case "$cmd" in
             esac
         done
 
+        out_dir="$(realpath -m -- "$out_dir")"
         mkdir -p -- "$out_dir"
         report_path="$out_dir/report.txt"
         jsonl_path="$out_dir/events.jsonl"
@@ -307,7 +308,7 @@ PY
             case "$1" in
                 --baseline) baseline="$2"; shift 2 ;;
                 --max-anomalies) max_anoms="$2"; shift 2 ;;
-                --out-dir) check_out="$2"; replay_args+=("$1" "$2"); shift 2 ;;
+                --out-dir) check_out="$(realpath -m -- "$2")"; replay_args+=("$1" "$check_out"); shift 2 ;;
                 -h|--help) usage; exit 0 ;;
                 *) replay_args+=("$1"); shift ;;
             esac
