@@ -162,3 +162,26 @@ A verificação diferencial (`974.865` checagens matemáticas em 25 frames reais
   1. `0x0016EE78` (`atan(double)`) — `ra=0x0016B4D8` (`stack=atan2 -> atan`)
   2. `0x00170208` (`atan2(double)`) — `ra=0x0010C4F4` (sinal invertido) e `ra=0x006E9A54` (`stack=ovl_btl_cam_update -> ovl_btl_cam_apply_shake -> atan2`)
 - **Confirmação A/B (`tools/battle_debug.sh replay --host-math`):** ao substituir os retornos divergentes pelo valor IEEE-754 do host, os pontos `atan2` da câmera (`ra=0x006E9A54`, `18x -> 0`) e `__truncdfsf2(nan -> inf)` (`ra=0x0010C500`, `662x -> 0`) desapareceram completamente.
+
+---
+
+## Resolução (Causa Raiz Real + Fix)
+
+Ao inspecionar o código gerado e os bindings SDK para `0x0016EE78` (`atan`) e `0x0016F4B0` (`fabs`), a causa raiz exata foi identificada:
+
+- **`runtime/overrides/edo_sdk_bindings.inc`** estava ligando cinco funções `double` da `libm` do PS2 (`atan` `0x0016EE78`, `cos` `0x0016F388`, `fabs` `0x0016F4B0`, `floor` `0x0016F4E8`, `sin` `0x0016F970`) aos stubs `ps2_stubs::*` de `external/PS2Recomp/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp`.
+- Na ABI do R5900 (sem FPU `double` em hardware), argumentos e retornos `double` trafegam em GPRs de 64 bits (`$a0` → `$v0`), enquanto os stubs `ps2_stubs::{atan,cos,fabs,floor,sin}` leem `$f12` e escrevem `$f0` (`float`):
+  - `ps2_stubs::fabs` não escrevia em `$v0`, fazendo `atan2` passar `y/x` ainda negativo para `atan`.
+  - `ps2_stubs::atan` escrevia um `float` de 32 bits em `$v0` via `setReturnU32`, que faz *sign-extension* para 64 bits e produzia exatamente `0xFFFFFFFFBFC8D24A` (`-nan` em `double`).
+
+### Fix Aplicado
+
+- Commit `f3e35b5`: excluídos `atan`, `cos`, `fabs`, `floor` e `sin` em `tools/gen_sdk_bindings.py` e `runtime/overrides/edo_sdk_bindings.inc`, mantendo as versões recompiladas nativamente do `SLES_556.05`.
+
+### Validação
+
+- `tools/battle_debug.sh replay --max-frames 150 --trace-fighters --screenshot-on-anomaly --out-dir .cache/battle-debug-fix`:
+  - `battleFrame=150`, **`totalAnomalies=0`**, **`mathChecks=1212649`**, **`mathMismatches=0`** (queda de `7430 -> 0` anomalias, todos os 24 pontos anteriores resolvidos).
+  - Screenshot `final_f150.ppm` confirmou cena 3D (cenário, Kakashi, Naruto, efeitos de golpe `"2 hits"` com *camera shake* ativo e HUD) 100% intacta muito após o ponto anterior de tela preta (frame 85–112).
+- `tools/battle_debug.sh check --max-anomalies 0 --max-frames 350 --screenshot-on-anomaly --out-dir .cache/battle-debug-check`:
+  - **`PASS`** (`battleFrame=350`, `totalAnomalies=0`, `mathChecks=1581636`, `mathMismatches=0`, `preemptedSkips=114`).
