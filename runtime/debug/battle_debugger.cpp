@@ -1394,10 +1394,83 @@ bool BattleDebugger::dumpReport(const std::string &path) const
 void BattleDebugger::drawUi(PS2Runtime & /*runtime*/)
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
-    if (!m_uiVisible)
+    const bool drawOverlay = m_overlay3dEnabled.load(std::memory_order_relaxed);
+    if (!m_uiVisible && !drawOverlay)
         return;
 
     const SnapshotForUi snap = captureUiSnapshot();
+
+    if (drawOverlay && snap.btlActive && snap.actors.hasViewProj)
+    {
+        const float sw = static_cast<float>(GetScreenWidth());
+        const float sh = static_cast<float>(GetScreenHeight());
+        const float *vp = snap.actors.viewProj;
+        auto project = [&](float x, float y, float z, ImVec2 &out) -> bool {
+            const float cx = vp[0] * x + vp[4] * y + vp[8] * z + vp[12];
+            const float cy = vp[1] * x + vp[5] * y + vp[9] * z + vp[13];
+            const float cw = vp[3] * x + vp[7] * y + vp[11] * z + vp[15];
+            if (cw <= 1e-4f || isBadFloat(cx) || isBadFloat(cy) || isBadFloat(cw))
+                return false;
+            const float nx = cx / cw;
+            const float ny = cy / cw;
+            if (nx < -2.0f || nx > 2.0f || ny < -2.0f || ny > 2.0f)
+                return false;
+            out.x = (nx * 0.5f + 0.5f) * sw;
+            out.y = (ny * 0.5f + 0.5f) * sh;
+            return true;
+        };
+
+        ImDrawList *dl = ImGui::GetForegroundDrawList();
+        ImVec2 pScreen[2]{};
+        bool pVis[2]{false, false};
+        const ImU32 colors[2] = {IM_COL32(60, 220, 255, 230), IM_COL32(255, 165, 60, 230)};
+
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto &ft = snap.actors.fighters[i];
+            if (!ft.present || !ft.valid)
+                continue;
+            if (project(ft.pos[0], ft.pos[1], ft.pos[2], pScreen[i]))
+            {
+                pVis[i] = true;
+                dl->AddCircle(pScreen[i], 9.0f, colors[i], 16, 2.0f);
+                ImVec2 head{};
+                if (project(ft.pos[0], ft.pos[1], ft.pos[2] + 120.0f, head))
+                {
+                    dl->AddLine(pScreen[i], head, colors[i], 2.0f);
+                    dl->AddCircleFilled(head, 4.0f, colors[i]);
+                }
+                char lbl[96];
+                std::snprintf(lbl, sizeof(lbl), "P%d (%.0f,%.0f,%.0f) d=%.1f",
+                              i + 1, ft.pos[0], ft.pos[1], ft.pos[2], ft.deltaDist);
+                dl->AddText(ImVec2(pScreen[i].x + 12.0f, pScreen[i].y - 8.0f), colors[i], lbl);
+            }
+        }
+
+        if (pVis[0] && pVis[1])
+        {
+            dl->AddLine(pScreen[0], pScreen[1], IM_COL32(255, 255, 255, 110), 1.0f);
+            ImVec2 mid((pScreen[0].x + pScreen[1].x) * 0.5f, (pScreen[0].y + pScreen[1].y) * 0.5f);
+            char dlbl[48];
+            std::snprintf(dlbl, sizeof(dlbl), "dist=%.1f", snap.actors.distP1P2);
+            dl->AddText(mid, IM_COL32(255, 255, 180, 220), dlbl);
+        }
+
+        if (snap.currentCam.valid)
+        {
+            ImVec2 tgt2d{};
+            if (project(snap.currentCam.tgt[0], snap.currentCam.tgt[1], snap.currentCam.tgt[2], tgt2d))
+            {
+                const ImU32 ycol = IM_COL32(255, 240, 80, 220);
+                dl->AddLine(ImVec2(tgt2d.x - 8, tgt2d.y), ImVec2(tgt2d.x + 8, tgt2d.y), ycol, 1.5f);
+                dl->AddLine(ImVec2(tgt2d.x, tgt2d.y - 8), ImVec2(tgt2d.x, tgt2d.y + 8), ycol, 1.5f);
+                dl->AddText(ImVec2(tgt2d.x + 10, tgt2d.y - 6), ycol, "CAM TGT");
+            }
+        }
+    }
+
+    if (!m_uiVisible)
+        return;
 
     ImGui::SetNextWindowSize(ImVec2(820.0f, 560.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Battle Debugger [F2]", &m_uiVisible))
@@ -1420,6 +1493,16 @@ void BattleDebugger::drawUi(PS2Runtime & /*runtime*/)
         bool traceCam = isTraceCamera();
         if (ImGui::Checkbox("Trace Cam", &traceCam))
             setTraceCamera(traceCam);
+        ImGui::SameLine();
+
+        bool traceFighters = isTraceFighters();
+        if (ImGui::Checkbox("Trace P1/P2", &traceFighters))
+            setTraceFighters(traceFighters);
+        ImGui::SameLine();
+
+        bool ovl3d = snap.overlay3dEnabled;
+        if (ImGui::Checkbox("Overlay 3D", &ovl3d))
+            setOverlay3dEnabled(ovl3d);
 
         ImGui::SameLine();
         if (snap.paused)
@@ -1545,6 +1628,37 @@ void BattleDebugger::drawUi(PS2Runtime & /*runtime*/)
                 ImGui::EndTabItem();
             }
 
+            if (ImGui::BeginTabItem("Fighters"))
+            {
+                ImGui::Text("Battle Frame: %llu | CamCtx: 0x%08X | Dist(P1,P2): %.2f | ViewProj: %s",
+                            static_cast<unsigned long long>(snap.actors.battleFrame),
+                            snap.actors.camCtxAddr,
+                            snap.actors.distP1P2,
+                            snap.actors.hasViewProj ? "OK" : "none/bad");
+                ImGui::Separator();
+                for (int i = 0; i < 2; ++i)
+                {
+                    const auto &ft = snap.actors.fighters[i];
+                    if (!ft.present)
+                    {
+                        ImGui::Text("P%d: (not present)", i + 1);
+                        continue;
+                    }
+                    ImGui::Text("P%d  addr=0x%08X  status=%s%s  altFlag=%d",
+                                i + 1, ft.addr, ft.valid ? "OK" : "CORRUPT",
+                                ft.reason.empty() ? "" : (" [" + ft.reason + "]").c_str(),
+                                static_cast<int>(ft.altPosFlag));
+                    ImGui::Text("  pos   = (%.3f [0x%08X], %.3f [0x%08X], %.3f [0x%08X])",
+                                ft.pos[0], floatBits(ft.pos[0]),
+                                ft.pos[1], floatBits(ft.pos[1]),
+                                ft.pos[2], floatBits(ft.pos[2]));
+                    ImGui::Text("  delta = %.3f / frame | scale=(%.3f, %.3f, %.3f)",
+                                ft.deltaDist, ft.scaleE4, ft.scaleE8, ft.scale2F0);
+                    ImGui::Separator();
+                }
+                ImGui::EndTabItem();
+            }
+
             if (ImGui::BeginTabItem("Trace"))
             {
                 if (ImGui::BeginTable("btl_traces", 5,
@@ -1597,7 +1711,7 @@ extern "C" bool ps2xDebugUiHasExtraOverlay()
         if (dbg.isUiVisible() && !dbg.isEnabled())
             dbg.setEnabled(true);
     }
-    return dbg.isUiVisible();
+    return dbg.isUiVisible() || dbg.isOverlay3dEnabled();
 }
 
 extern "C" void ps2xDebugUiDrawExtraOverlay(PS2Runtime &runtime)
