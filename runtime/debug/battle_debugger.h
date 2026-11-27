@@ -111,6 +111,8 @@ struct SnapshotForUi
     uint64_t mathChecks = 0;
     uint64_t mathMismatches = 0;
     uint64_t preemptedSkips = 0;
+    uint64_t hostMathOverrides = 0;
+    bool hostMathEnabled = false;
     CameraSnapshot currentCam;
     CameraSnapshot lastGoodCam;
     bool hasLastGoodCam = false;
@@ -192,6 +194,9 @@ public:
     bool isMathCheckEnabled() const { return m_mathCheckEnabled.load(std::memory_order_relaxed); }
     void setMathCheckEnabled(bool v) { m_mathCheckEnabled.store(v, std::memory_order_relaxed); }
 
+    bool isHostMathEnabled() const { return m_hostMathEnabled.load(std::memory_order_relaxed); }
+    void setHostMathEnabled(bool v) { m_hostMathEnabled.store(v, std::memory_order_relaxed); }
+
     bool isBreakOnAnomaly() const { return m_breakOnAnomaly.load(std::memory_order_relaxed); }
     void setBreakOnAnomaly(bool v) { m_breakOnAnomaly.store(v, std::memory_order_relaxed); }
 
@@ -216,6 +221,7 @@ public:
     void updateViewProjMatrix(const float vp[16], bool valid);
     void countMathCheck(bool mismatch);
     void countPreemptedSkip() { m_preemptedSkips.fetch_add(1, std::memory_order_relaxed); }
+    void countHostMathOverride() { m_hostMathOverrides.fetch_add(1, std::memory_order_relaxed); }
 
     void recordTrace(Category cat, uint32_t funcAddr, uint32_t callerRa, const char *fmt, ...);
     void recordAnomaly(Category cat, Severity sev, uint32_t funcAddr, uint32_t callerRa,
@@ -247,6 +253,7 @@ private:
     std::atomic<bool> m_enabled{false};
     std::atomic<bool> m_btlActive{false};
     std::atomic<bool> m_mathCheckEnabled{true};
+    std::atomic<bool> m_hostMathEnabled{false};
     std::atomic<bool> m_breakOnAnomaly{false};
     std::atomic<bool> m_traceCamera{false};
     std::atomic<bool> m_traceFighters{false};
@@ -260,6 +267,7 @@ private:
     std::atomic<uint64_t> m_mathChecks{0};
     std::atomic<uint64_t> m_mathMismatches{0};
     std::atomic<uint64_t> m_preemptedSkips{0};
+    std::atomic<uint64_t> m_hostMathOverrides{0};
 
     uint64_t m_stopAfterAnomalyFrames = 0;
     uint64_t m_maxBattleFrames = 0;

@@ -399,6 +399,11 @@ void hookAtan2_00170208(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
                 x, static_cast<unsigned long long>(rawX),
                 guest, static_cast<unsigned long long>(rawRes),
                 host, static_cast<unsigned long long>(doubleBits(host)));
+            if (dbg.isHostMathEnabled())
+            {
+                SET_GPR_U64(ctx, 2, doubleBits(host));
+                dbg.countHostMathOverride();
+            }
         }
     }
 }
@@ -432,6 +437,11 @@ void hookAtan_0016ee78(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
                 x, static_cast<unsigned long long>(rawX),
                 guest, static_cast<unsigned long long>(rawRes),
                 host, static_cast<unsigned long long>(doubleBits(host)));
+            if (dbg.isHostMathEnabled())
+            {
+                SET_GPR_U64(ctx, 2, doubleBits(host));
+                dbg.countHostMathOverride();
+            }
         }
     }
 }
@@ -468,6 +478,11 @@ void hookDivdf3_00172888(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
                 b, static_cast<unsigned long long>(rawB),
                 guest, static_cast<unsigned long long>(rawRes),
                 host, static_cast<unsigned long long>(doubleBits(host)));
+            if (dbg.isHostMathEnabled())
+            {
+                SET_GPR_U64(ctx, 2, doubleBits(host));
+                dbg.countHostMathOverride();
+            }
         }
     }
 }
@@ -504,6 +519,11 @@ void hookMuldf3_00172600(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
                 b, static_cast<unsigned long long>(rawB),
                 guest, static_cast<unsigned long long>(rawRes),
                 host, static_cast<unsigned long long>(doubleBits(host)));
+            if (dbg.isHostMathEnabled())
+            {
+                SET_GPR_U64(ctx, 2, doubleBits(host));
+                dbg.countHostMathOverride();
+            }
         }
     }
 }
@@ -540,6 +560,11 @@ void hookAdddf3_00172540(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
                 b, static_cast<unsigned long long>(rawB),
                 guest, static_cast<unsigned long long>(rawRes),
                 host, static_cast<unsigned long long>(doubleBits(host)));
+            if (dbg.isHostMathEnabled())
+            {
+                SET_GPR_U64(ctx, 2, doubleBits(host));
+                dbg.countHostMathOverride();
+            }
         }
     }
 }
@@ -576,6 +601,11 @@ void hookSubdf3_00172598(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
                 b, static_cast<unsigned long long>(rawB),
                 guest, static_cast<unsigned long long>(rawRes),
                 host, static_cast<unsigned long long>(doubleBits(host)));
+            if (dbg.isHostMathEnabled())
+            {
+                SET_GPR_U64(ctx, 2, doubleBits(host));
+                dbg.countHostMathOverride();
+            }
         }
     }
 }
@@ -812,6 +842,11 @@ void hookExtendsfdf2_00172108(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
                 f, floatBits(f),
                 guest, static_cast<unsigned long long>(rawRes),
                 host, static_cast<unsigned long long>(doubleBits(host)));
+            if (dbg.isHostMathEnabled())
+            {
+                SET_GPR_U64(ctx, 2, doubleBits(host));
+                dbg.countHostMathOverride();
+            }
         }
     }
 }
@@ -843,6 +878,11 @@ void hookTruncdfsf2_00172cc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runt
                 "d=%.6g[0x%016llX] -> guest=%.6g[0x%08X] host=%.6g[0x%08X]",
                 d, static_cast<unsigned long long>(rawD),
                 guest, floatBits(guest), host, floatBits(host));
+            if (dbg.isHostMathEnabled())
+            {
+                ctx->f[0] = host;
+                dbg.countHostMathOverride();
+            }
         }
     }
 }
@@ -1144,6 +1184,7 @@ void BattleDebugger::initFromEnv()
     m_enabled.store(enabled, std::memory_order_relaxed);
     m_breakOnAnomaly.store(envFlagEnabled("EDO_BATTLE_BREAK", false), std::memory_order_relaxed);
     m_mathCheckEnabled.store(envFlagEnabled("EDO_BATTLE_MATH_CHECK", true), std::memory_order_relaxed);
+    m_hostMathEnabled.store(envFlagEnabled("EDO_BATTLE_HOST_MATH", false), std::memory_order_relaxed);
     m_traceCamera.store(envFlagEnabled("EDO_BATTLE_TRACE_CAMERA", false), std::memory_order_relaxed);
     m_traceFighters.store(envFlagEnabled("EDO_BATTLE_TRACE_FIGHTERS", false), std::memory_order_relaxed);
     m_overlay3dEnabled.store(envFlagEnabled("EDO_BATTLE_OVERLAY_3D", false), std::memory_order_relaxed);
@@ -1679,6 +1720,7 @@ void BattleDebugger::clear()
     m_mathChecks.store(0, std::memory_order_relaxed);
     m_mathMismatches.store(0, std::memory_order_relaxed);
     m_preemptedSkips.store(0, std::memory_order_relaxed);
+    m_hostMathOverrides.store(0, std::memory_order_relaxed);
 }
 
 SnapshotForUi BattleDebugger::captureUiSnapshot() const
@@ -1687,6 +1729,7 @@ SnapshotForUi BattleDebugger::captureUiSnapshot() const
     out.enabled = m_enabled.load(std::memory_order_relaxed);
     out.btlActive = m_btlActive.load(std::memory_order_relaxed);
     out.mathCheckEnabled = m_mathCheckEnabled.load(std::memory_order_relaxed);
+    out.hostMathEnabled = m_hostMathEnabled.load(std::memory_order_relaxed);
     out.breakOnAnomaly = m_breakOnAnomaly.load(std::memory_order_relaxed);
     out.paused = m_paused.load(std::memory_order_relaxed);
     out.battleFrame = m_battleFrame.load(std::memory_order_relaxed);
@@ -1694,6 +1737,7 @@ SnapshotForUi BattleDebugger::captureUiSnapshot() const
     out.mathChecks = m_mathChecks.load(std::memory_order_relaxed);
     out.mathMismatches = m_mathMismatches.load(std::memory_order_relaxed);
     out.preemptedSkips = m_preemptedSkips.load(std::memory_order_relaxed);
+    out.hostMathOverrides = m_hostMathOverrides.load(std::memory_order_relaxed);
 
     std::lock_guard<std::mutex> lock(m_mutex);
     out.currentCam = m_currentCam;
@@ -1728,7 +1772,8 @@ bool BattleDebugger::dumpReport(const std::string &path) const
       << " totalAnomalies=" << snap.totalAnomalies
       << " mathChecks=" << snap.mathChecks
       << " mathMismatches=" << snap.mathMismatches
-      << " preemptedSkips=" << snap.preemptedSkips << "\n\n";
+      << " preemptedSkips=" << snap.preemptedSkips
+      << " hostMathOverrides=" << snap.hostMathOverrides << "\n\n";
 
     if (snap.firstAnomaly.has_value())
     {
@@ -2019,6 +2064,11 @@ void BattleDebugger::drawUi(PS2Runtime &runtime)
         bool mathCheck = snap.mathCheckEnabled;
         if (ImGui::Checkbox("Math Diff", &mathCheck))
             setMathCheckEnabled(mathCheck);
+        ImGui::SameLine();
+
+        bool hostMath = snap.hostMathEnabled;
+        if (ImGui::Checkbox("Host Math A/B", &hostMath))
+            setHostMathEnabled(hostMath);
         ImGui::SameLine();
 
         bool breakAnom = snap.breakOnAnomaly;

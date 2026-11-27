@@ -29,6 +29,7 @@ Opcoes (replay / run):
   --watch ADDR:SIZE[,...]      Enderecos extras de RDRAM para incluir no snapshot (ex: 0x00617EF0:0x40)
   --pad FILE                   Arquivo de captura de controle para replay
   --no-math                    Desativa o comparador diferencial de matematica (Guest vs Host)
+  --host-math                  Modo A/B: substitui retornos soft-float double divergentes pelo host
   --break                      Pausa a luta automaticamente na primeira anomalia (modo interativo)
   --trace-camera               Registra trace por frame da camera no ring buffer/JSONL
   --trace-fighters             Registra trace por frame de P1/P2 e distancia no ring buffer/JSONL
@@ -54,6 +55,7 @@ case "$cmd" in
         watch_mem=""
         pad_file="$ROOT/.cache/luta-livre/pad.txt"
         math_check=1
+        host_math=0
         break_on_anom=0
         trace_cam=0
         trace_fighters=0
@@ -70,6 +72,7 @@ case "$cmd" in
                 --watch) watch_mem="$2"; shift 2 ;;
                 --pad) pad_file="$2"; shift 2 ;;
                 --no-math) math_check=0; shift ;;
+                --host-math) host_math=1; shift ;;
                 --break) break_on_anom=1; shift ;;
                 --trace-camera) trace_cam=1; shift ;;
                 --trace-fighters) trace_fighters=1; shift ;;
@@ -92,6 +95,7 @@ case "$cmd" in
         export EDO_BATTLE_JSONL="$jsonl_path"
         export EDO_BATTLE_SNAPSHOT="$snapshot_path"
         export EDO_BATTLE_MATH_CHECK="$math_check"
+        export EDO_BATTLE_HOST_MATH="$host_math"
         export EDO_BATTLE_BREAK="$break_on_anom"
         export EDO_BATTLE_TRACE_CAMERA="$trace_cam"
         export EDO_BATTLE_TRACE_FIGHTERS="$trace_fighters"
