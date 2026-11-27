@@ -1,0 +1,57 @@
+From: Edo Tensei <edo-tensei@local>
+Subject: [PATCH] ps2xRuntime: emular comparacoes FPU PS2 para valores com expoente 255 (PS2_FLOAT_MAX_BITS)
+
+O FPU do EE no PS2 nao possui NaN nem Inf: valores com expoente 255 (como
++-PS2_FLOAT_MAX_BITS = 0x7FFFFFFF / 0xFFFFFFFF retornados por ps2_fdiv_slow e
+ps2_frsqrt_slow) sao numeros finitos de sinal-magnitude. Como FPU_C_EQ_S,
+FPU_C_OLT_S e FPU_C_OLE_S usavam comparacoes IEEE-754 cruas do host, 0xFFFFFFFF
+era tratado como NaN e falhava em clamps (c.lt.s / c.le.s), vazando -nan para a
+camera de batalha (ovl_btl_FUN_006e95f0) e zerando a matriz de projecao 3D.
+
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -311,6 +311,23 @@ inline float ps2_frsqrt(float a, float b)
+     return ps2_fall_normal(a, b, r) ? r : ps2_frsqrt_slow(a, b);
+ }
+ 
++// PS2 EE FPU has no NaN/Inf: exponent 255 values (including +-PS2_FLOAT_MAX_BITS) are finite
++// sign-magnitude floats and must compare as finite numbers rather than host IEEE-754 NaN.
++inline bool ps2_feq(float a, float b)
++{
++    return !(ps2_fspecial(a) | ps2_fspecial(b)) ? (a == b) : (ps2_to_double(a) == ps2_to_double(b));
++}
++
++inline bool ps2_flt(float a, float b)
++{
++    return !(ps2_fspecial(a) | ps2_fspecial(b)) ? (a < b) : (ps2_to_double(a) < ps2_to_double(b));
++}
++
++inline bool ps2_fle(float a, float b)
++{
++    return !(ps2_fspecial(a) | ps2_fspecial(b)) ? (a <= b) : (ps2_to_double(a) <= ps2_to_double(b));
++}
++
+ enum class Ps2VecOp
+ {
+     Add,
+@@ -856,13 +873,13 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+ #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+ #define FPU_C_F_S(a, b) (0)
+-#define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_EQ_S(a, b) ((float)(a) == (float)(b))
+-#define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_OLT_S(a, b) ((float)(a) < (float)(b))
+-#define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_OLE_S(a, b) ((float)(a) <= (float)(b))
+-#define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_UN_S(a, b) (0)
++#define FPU_C_EQ_S(a, b) ps2_feq((float)(a), (float)(b))
++#define FPU_C_UEQ_S(a, b) ps2_feq((float)(a), (float)(b))
++#define FPU_C_OLT_S(a, b) ps2_flt((float)(a), (float)(b))
++#define FPU_C_ULT_S(a, b) ps2_flt((float)(a), (float)(b))
++#define FPU_C_OLE_S(a, b) ps2_fle((float)(a), (float)(b))
++#define FPU_C_ULE_S(a, b) ps2_fle((float)(a), (float)(b))
+ 
+ // VU0 operations (macro mode)
+ // Vector register operations (4-element float vectors)
