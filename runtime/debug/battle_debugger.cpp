@@ -156,6 +156,33 @@ bool isBtlAddress(uint32_t addr)
 // Core & Math Hooks (Main ELF)
 // ---------------------------------------------------------------------------
 
+void hookRenderCamera_0010e430(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    auto &dbg = BattleDebugger::instance();
+    const bool check = dbg.isEnabled() && dbg.isBtlActive() && ctx->pc == 0x0010E430u;
+    const uint32_t renderCam = check ? getRegU32(ctx, 4) : 0;
+    const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+
+    FUN_0010e430_0x10e430(rdram, ctx, runtime);
+
+    if (check)
+    {
+        float vp[16]{};
+        if (const uint8_t *p = getConstMemPtr(rdram, renderCam + 0xC0u))
+            std::memcpy(vp, p, sizeof(vp));
+        const bool bad = isBadMat4(vp) || isZeroMat4(vp);
+        dbg.updateViewProjMatrix(vp, !bad);
+        if (bad)
+        {
+            dbg.recordAnomaly(
+                Category::Matrix, Severity::Critical, 0x0010E430u, ra, "FUN_0010e430(ViewProj)",
+                "renderCam=0x%08X vp_bad=%d vp_zero=%d m0=(%.4g,%.4g,%.4g,%.4g) m3=(%.4g,%.4g,%.4g,%.4g)",
+                renderCam, isBadMat4(vp) ? 1 : 0, isZeroMat4(vp) ? 1 : 0,
+                vp[0], vp[1], vp[2], vp[3], vp[12], vp[13], vp[14], vp[15]);
+        }
+    }
+}
+
 void hookCameraLookAt_0019f990(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     auto &dbg = BattleDebugger::instance();
@@ -461,6 +488,30 @@ void hookBtlCameraUpdate_006e95f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime 
                     snap.shake[0], snap.shake[1], snap.shake[2]);
             }
             dbg.updateCameraSnapshot(snap);
+
+            // Inspect P1 (s2+0x20) and P2 (s2+0x24) fighter structs every battle frame.
+            uint32_t fighterPtrs[2]{};
+            std::memcpy(&fighterPtrs[0], p + 0x20, 4);
+            std::memcpy(&fighterPtrs[1], p + 0x24, 4);
+            FighterSnapshot fighters[2]{};
+            for (int i = 0; i < 2; ++i)
+            {
+                const uint32_t faddr = fighterPtrs[i];
+                if (faddr == 0u)
+                    continue;
+                const uint8_t *fp = getConstMemPtr(rdram, faddr);
+                if (!fp)
+                    continue;
+                fighters[i].present = true;
+                fighters[i].addr = faddr;
+                std::memcpy(&fighters[i].altPosFlag, fp + 0x9F0, 2);
+                const uint32_t posOff = (fighters[i].altPosFlag == 0) ? 0x30u : 0x2C0u;
+                std::memcpy(fighters[i].pos, fp + posOff, 16);
+                std::memcpy(&fighters[i].scaleE4, fp + 0xE4, 4);
+                std::memcpy(&fighters[i].scaleE8, fp + 0xE8, 4);
+                std::memcpy(&fighters[i].scale2F0, fp + 0x2F0, 4);
+            }
+            dbg.updateFightersSnapshot(s2, fighters);
         }
     }
 }
@@ -536,6 +587,8 @@ void BattleDebugger::initFromEnv()
     m_breakOnAnomaly.store(envFlagEnabled("EDO_BATTLE_BREAK", false), std::memory_order_relaxed);
     m_mathCheckEnabled.store(envFlagEnabled("EDO_BATTLE_MATH_CHECK", true), std::memory_order_relaxed);
     m_traceCamera.store(envFlagEnabled("EDO_BATTLE_TRACE_CAMERA", false), std::memory_order_relaxed);
+    m_traceFighters.store(envFlagEnabled("EDO_BATTLE_TRACE_FIGHTERS", false), std::memory_order_relaxed);
+    m_overlay3dEnabled.store(envFlagEnabled("EDO_BATTLE_OVERLAY_3D", false), std::memory_order_relaxed);
     m_logStderr.store(envFlagEnabled("EDO_BATTLE_STDERR", true), std::memory_order_relaxed);
     m_stopAfterAnomalyFrames = envU64("EDO_BATTLE_STOP_AFTER", 0);
     m_maxBattleFrames = envU64("EDO_BATTLE_MAX_FRAMES", 0);
@@ -581,6 +634,7 @@ void BattleDebugger::initFromEnv()
 
 void BattleDebugger::installCoreHooks(PS2Runtime &runtime)
 {
+    runtime.replaceFunction(0x0010E430u, &hookRenderCamera_0010e430);
     runtime.replaceFunction(0x0019F990u, &hookCameraLookAt_0019f990);
     runtime.replaceFunction(0x00153170u, &hookRotMatrixZ_00153170);
     runtime.replaceFunction(0x00152DA8u, &hookApplyMatrix_00152da8);
@@ -681,6 +735,135 @@ void BattleDebugger::updateCameraSnapshot(const CameraSnapshot &snap)
         m_lastGoodCam = m_currentCam;
         m_hasLastGoodCam = true;
     }
+}
+
+void BattleDebugger::updateFightersSnapshot(uint32_t camCtxAddr, const FighterSnapshot fightersIn[2])
+{
+    const uint64_t frame = m_battleFrame.load(std::memory_order_relaxed);
+    FighterSnapshot updated[2];
+    bool anomalyBad[2]{false, false};
+    bool anomalyOob[2]{false, false};
+    bool anomalyTeleport[2]{false, false};
+    float distP1P2 = 0.0f;
+    bool distAnomaly = false;
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (int i = 0; i < 2; ++i)
+        {
+            updated[i] = fightersIn[i];
+            const FighterSnapshot &prev = m_actors.fighters[i];
+            if (!updated[i].present)
+                continue;
+
+            const bool hadPrev = prev.present && prev.addr == updated[i].addr &&
+                                 m_actors.battleFrame + 1 == frame && !isBadVec3(prev.pos);
+            if (hadPrev)
+                std::memcpy(updated[i].prevPos, prev.pos, sizeof(updated[i].prevPos));
+
+            if (isBadVec3(updated[i].pos))
+            {
+                updated[i].valid = false;
+                updated[i].reason = "nan_or_inf_pos";
+                anomalyBad[i] = true;
+            }
+            else
+            {
+                const float x = updated[i].pos[0];
+                const float y = updated[i].pos[1];
+                const float z = updated[i].pos[2];
+                if (std::fabs(x) > 5000.0f || std::fabs(y) > 5000.0f || z < -500.0f || z > 5000.0f)
+                {
+                    updated[i].valid = false;
+                    updated[i].reason = "out_of_bounds";
+                    anomalyOob[i] = true;
+                }
+                if (hadPrev)
+                {
+                    const float dx = x - prev.pos[0];
+                    const float dy = y - prev.pos[1];
+                    const float dz = z - prev.pos[2];
+                    updated[i].deltaDist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (updated[i].altPosFlag == 0 && prev.altPosFlag == 0 && updated[i].deltaDist > 250.0f)
+                    {
+                        anomalyTeleport[i] = true;
+                    }
+                }
+            }
+        }
+
+        if (updated[0].present && updated[1].present && updated[0].valid && updated[1].valid)
+        {
+            const float dx = updated[1].pos[0] - updated[0].pos[0];
+            const float dy = updated[1].pos[1] - updated[0].pos[1];
+            const float dz = updated[1].pos[2] - updated[0].pos[2];
+            distP1P2 = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (isBadFloat(distP1P2) || distP1P2 > 5000.0f)
+                distAnomaly = true;
+        }
+
+        m_actors.battleFrame = frame;
+        m_actors.camCtxAddr = camCtxAddr;
+        m_actors.fighters[0] = updated[0];
+        m_actors.fighters[1] = updated[1];
+        m_actors.distP1P2 = distP1P2;
+    }
+
+    for (int i = 0; i < 2; ++i)
+    {
+        const uint32_t tagAddr = 0x006E95F0u + static_cast<uint32_t>(i);
+        const char *label = (i == 0) ? "fighter_P1" : "fighter_P2";
+        if (anomalyBad[i])
+        {
+            recordAnomaly(Category::Collision, Severity::Critical, tagAddr, updated[i].addr, label,
+                          "pos=(%.4g[0x%08X],%.4g[0x%08X],%.4g[0x%08X]) alt=%d",
+                          updated[i].pos[0], floatBits(updated[i].pos[0]),
+                          updated[i].pos[1], floatBits(updated[i].pos[1]),
+                          updated[i].pos[2], floatBits(updated[i].pos[2]),
+                          static_cast<int>(updated[i].altPosFlag));
+        }
+        else if (anomalyOob[i])
+        {
+            recordAnomaly(Category::Collision, Severity::Error, tagAddr, updated[i].addr, label,
+                          "OUT_OF_BOUNDS pos=(%.2f,%.2f,%.2f) alt=%d",
+                          updated[i].pos[0], updated[i].pos[1], updated[i].pos[2],
+                          static_cast<int>(updated[i].altPosFlag));
+        }
+        else if (anomalyTeleport[i])
+        {
+            recordAnomaly(Category::Collision, Severity::Warning, tagAddr, updated[i].addr, label,
+                          "TELEPORT delta=%.2f prev=(%.2f,%.2f,%.2f)->pos=(%.2f,%.2f,%.2f)",
+                          updated[i].deltaDist,
+                          updated[i].prevPos[0], updated[i].prevPos[1], updated[i].prevPos[2],
+                          updated[i].pos[0], updated[i].pos[1], updated[i].pos[2]);
+        }
+    }
+
+    if (distAnomaly)
+    {
+        recordAnomaly(Category::Collision, Severity::Error, 0x006E95F2u, camCtxAddr, "fighter_separation",
+                      "distP1P2=%.4g P1=(%.2f,%.2f,%.2f) P2=(%.2f,%.2f,%.2f)",
+                      distP1P2,
+                      updated[0].pos[0], updated[0].pos[1], updated[0].pos[2],
+                      updated[1].pos[0], updated[1].pos[1], updated[1].pos[2]);
+    }
+
+    if (isTraceFighters() && (updated[0].present || updated[1].present))
+    {
+        recordTrace(Category::Collision, 0x006E95F0u, camCtxAddr,
+                    "P1=(%.2f,%.2f,%.2f d=%.2f) P2=(%.2f,%.2f,%.2f d=%.2f) dist=%.2f",
+                    updated[0].pos[0], updated[0].pos[1], updated[0].pos[2], updated[0].deltaDist,
+                    updated[1].pos[0], updated[1].pos[1], updated[1].pos[2], updated[1].deltaDist,
+                    distP1P2);
+    }
+}
+
+void BattleDebugger::updateViewProjMatrix(const float vp[16], bool valid)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_actors.hasViewProj = valid;
+    if (valid)
+        std::memcpy(m_actors.viewProj, vp, sizeof(m_actors.viewProj));
 }
 
 void BattleDebugger::countMathCheck(bool mismatch)
@@ -892,6 +1075,8 @@ SnapshotForUi BattleDebugger::captureUiSnapshot() const
     out.currentCam = m_currentCam;
     out.lastGoodCam = m_lastGoodCam;
     out.hasLastGoodCam = m_hasLastGoodCam;
+    out.actors = m_actors;
+    out.overlay3dEnabled = m_overlay3dEnabled.load(std::memory_order_relaxed);
     out.firstAnomaly = m_firstAnomaly;
     out.anomalies.assign(m_anomalies.begin(), m_anomalies.end());
     out.traces.assign(m_traces.begin(), m_traces.end());
@@ -954,6 +1139,31 @@ bool BattleDebugger::dumpReport(const std::string &path) const
     writeCam("CURRENT CAMERA", snap.currentCam);
     if (snap.hasLastGoodCam)
         writeCam("LAST GOOD CAMERA", snap.lastGoodCam);
+    f << "\n";
+
+    f << "FIGHTERS (f=" << snap.actors.battleFrame
+      << " distP1P2=" << snap.actors.distP1P2
+      << " hasViewProj=" << (snap.actors.hasViewProj ? 1 : 0) << "):\n";
+    for (int i = 0; i < 2; ++i)
+    {
+        const auto &ft = snap.actors.fighters[i];
+        char buf[320];
+        if (ft.present)
+        {
+            std::snprintf(buf, sizeof(buf),
+                          "  P%d addr=0x%08X valid=%d%s%s pos=(%.3f, %.3f, %.3f) delta=%.2f alt=%d scale=(%.2f,%.2f,%.2f)\n",
+                          i + 1, ft.addr, ft.valid ? 1 : 0,
+                          ft.reason.empty() ? "" : " reason=", ft.reason.c_str(),
+                          ft.pos[0], ft.pos[1], ft.pos[2], ft.deltaDist,
+                          static_cast<int>(ft.altPosFlag),
+                          ft.scaleE4, ft.scaleE8, ft.scale2F0);
+        }
+        else
+        {
+            std::snprintf(buf, sizeof(buf), "  P%d (not present)\n", i + 1);
+        }
+        f << buf;
+    }
     f << "\n";
 
     f << "--- ANOMALIES (" << snap.anomalies.size() << " unique) ---\n";

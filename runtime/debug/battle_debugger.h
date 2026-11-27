@@ -50,6 +50,31 @@ struct CameraSnapshot
     std::string reason;
 };
 
+struct FighterSnapshot
+{
+    uint32_t addr = 0;
+    float pos[4]{};
+    float prevPos[4]{};
+    float deltaDist = 0.0f;
+    float scaleE4 = 0.0f;
+    float scaleE8 = 0.0f;
+    float scale2F0 = 0.0f;
+    int16_t altPosFlag = 0;
+    bool present = false;
+    bool valid = true;
+    std::string reason;
+};
+
+struct BattleActorsSnapshot
+{
+    uint64_t battleFrame = 0;
+    uint32_t camCtxAddr = 0;
+    FighterSnapshot fighters[2];
+    float distP1P2 = 0.0f;
+    bool hasViewProj = false;
+    float viewProj[16]{};
+};
+
 struct AnomalyEvent
 {
     uint64_t seq = 0;
@@ -87,6 +112,8 @@ struct SnapshotForUi
     CameraSnapshot currentCam;
     CameraSnapshot lastGoodCam;
     bool hasLastGoodCam = false;
+    BattleActorsSnapshot actors;
+    bool overlay3dEnabled = false;
     std::optional<AnomalyEvent> firstAnomaly;
     std::vector<AnomalyEvent> anomalies;
     std::vector<TraceEvent> traces;
@@ -169,6 +196,12 @@ public:
     bool isTraceCamera() const { return m_traceCamera.load(std::memory_order_relaxed); }
     void setTraceCamera(bool v) { m_traceCamera.store(v, std::memory_order_relaxed); }
 
+    bool isTraceFighters() const { return m_traceFighters.load(std::memory_order_relaxed); }
+    void setTraceFighters(bool v) { m_traceFighters.store(v, std::memory_order_relaxed); }
+
+    bool isOverlay3dEnabled() const { return m_overlay3dEnabled.load(std::memory_order_relaxed); }
+    void setOverlay3dEnabled(bool v) { m_overlay3dEnabled.store(v, std::memory_order_relaxed); }
+
     bool isPaused() const { return m_paused.load(std::memory_order_relaxed); }
     void setPaused(bool v) { m_paused.store(v, std::memory_order_relaxed); }
     void requestStepFrame() { m_stepRequests.fetch_add(1, std::memory_order_relaxed); }
@@ -177,6 +210,8 @@ public:
 
     void onBattleFrame(PS2Runtime *runtime);
     void updateCameraSnapshot(const CameraSnapshot &snap);
+    void updateFightersSnapshot(uint32_t camCtxAddr, const FighterSnapshot fighters[2]);
+    void updateViewProjMatrix(const float vp[16], bool valid);
     void countMathCheck(bool mismatch);
 
     void recordTrace(Category cat, uint32_t funcAddr, uint32_t callerRa, const char *fmt, ...);
@@ -207,6 +242,8 @@ private:
     std::atomic<bool> m_mathCheckEnabled{true};
     std::atomic<bool> m_breakOnAnomaly{false};
     std::atomic<bool> m_traceCamera{false};
+    std::atomic<bool> m_traceFighters{false};
+    std::atomic<bool> m_overlay3dEnabled{false};
     std::atomic<bool> m_logStderr{true};
     std::atomic<bool> m_paused{false};
     std::atomic<bool> m_autoStopTriggered{false};
@@ -228,6 +265,7 @@ private:
     CameraSnapshot m_currentCam;
     CameraSnapshot m_lastGoodCam;
     bool m_hasLastGoodCam = false;
+    BattleActorsSnapshot m_actors;
     std::optional<AnomalyEvent> m_firstAnomaly;
     std::deque<AnomalyEvent> m_anomalies;
     std::unordered_map<uint64_t, size_t> m_dedupIndex;

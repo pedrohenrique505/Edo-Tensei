@@ -24,7 +24,9 @@ Opcoes (replay / run):
   --pad FILE           Arquivo de captura de controle para replay (padrao: .cache/luta-livre/pad.txt)
   --no-math            Desativa o comparador diferencial de matematica (Guest vs Host)
   --break              Pausa a luta automaticamente na primeira anomalia (modo interativo)
-  --trace-camera       Registra trace por frame da camera no ring buffer
+  --trace-camera       Registra trace por frame da camera no ring buffer/JSONL
+  --trace-fighters     Registra trace por frame de P1/P2 e distancia no ring buffer/JSONL
+  --overlay-3d         Ativa o overlay 3D->2D (P1, P2, alvo da camera) ao abrir
   --quiet              Nao ecoa logs do battle-dbg no stderr (grava apenas nos arquivos)
 
 Opcoes (jsonl):
@@ -47,6 +49,8 @@ case "$cmd" in
         math_check=1
         break_on_anom=0
         trace_cam=0
+        trace_fighters=0
+        overlay_3d=0
         log_stderr=1
 
         while [[ $# -gt 0 ]]; do
@@ -59,6 +63,8 @@ case "$cmd" in
                 --no-math) math_check=0; shift ;;
                 --break) break_on_anom=1; shift ;;
                 --trace-camera) trace_cam=1; shift ;;
+                --trace-fighters) trace_fighters=1; shift ;;
+                --overlay-3d) overlay_3d=1; shift ;;
                 --quiet) log_stderr=0; shift ;;
                 -h|--help) usage; exit 0 ;;
                 *) echo "Opcao desconhecida: $1" >&2; usage >&2; exit 2 ;;
@@ -77,6 +83,8 @@ case "$cmd" in
         export EDO_BATTLE_MATH_CHECK="$math_check"
         export EDO_BATTLE_BREAK="$break_on_anom"
         export EDO_BATTLE_TRACE_CAMERA="$trace_cam"
+        export EDO_BATTLE_TRACE_FIGHTERS="$trace_fighters"
+        export EDO_BATTLE_OVERLAY_3D="$overlay_3d"
         export EDO_BATTLE_STDERR="$log_stderr"
         if [[ "$stop_after" -gt 0 ]]; then
             export EDO_BATTLE_STOP_AFTER="$stop_after"
