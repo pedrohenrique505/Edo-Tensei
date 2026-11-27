@@ -700,7 +700,10 @@ void hookBtlCameraUpdate_006e95f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime 
                 std::memcpy(&fighters[i].scaleE8, fp + 0xE8, 4);
                 std::memcpy(&fighters[i].scale2F0, fp + 0x2F0, 4);
             }
-            dbg.updateFightersSnapshot(s2, fighters);
+            if (fighters[0].present || fighters[1].present)
+            {
+                dbg.updateFightersSnapshot(s2, fighters);
+            }
         }
     }
 }
@@ -952,7 +955,8 @@ void BattleDebugger::updateFightersSnapshot(uint32_t camCtxAddr, const FighterSn
                 continue;
 
             const bool hadPrev = prev.present && prev.addr == updated[i].addr &&
-                                 m_actors.battleFrame + 1 == frame && !isBadVec3(prev.pos);
+                                 frame > m_actors.battleFrame && (frame - m_actors.battleFrame) <= 8 &&
+                                 !isBadVec3(prev.pos);
             if (hadPrev)
                 std::memcpy(updated[i].prevPos, prev.pos, sizeof(updated[i].prevPos));
 
