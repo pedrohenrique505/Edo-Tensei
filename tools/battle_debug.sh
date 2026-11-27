@@ -171,7 +171,7 @@ for line in open(path, encoding="utf-8", errors="replace"):
         break
     if not in_anom:
         continue
-    m = re.match(r"^\[#(\d+)\s+f=(\d+)\s+([A-Z]+)/([A-Z]+)\s+x(\d+)\]\s+fn=(0x[0-9A-Fa-f]+)\(([^)]*)\)\s+ra=(0x[0-9A-Fa-f]+)\s*\|\s*(.*)$", line.strip())
+    m = re.match(r"^\[#(\d+)\s+f=(\d+)\s+([A-Z]+)/([A-Z]+)\s+x(\d+)\]\s+fn=(0x[0-9A-Fa-f]+)\((.+?)\)\s+ra=(0x[0-9A-Fa-f]+)\s*\|\s*(.*)$", line.strip())
     if m:
         rows.append((int(m.group(5)), int(m.group(2)), m.group(3), m.group(4), m.group(6), m.group(7), m.group(8), m.group(9)))
 rows.sort(key=lambda r: (-r[0], r[1]))
@@ -249,7 +249,7 @@ def parse(path):
         elif line.startswith("--- RECENT TRACE"):
             in_anom = False
         elif in_anom:
-            m = re.match(r"^\[#\d+\s+f=(\d+)\s+([A-Z]+)/([A-Z]+)\s+x(\d+)\]\s+fn=(0x[0-9A-Fa-f]+)\(([^)]*)\)\s+ra=(0x[0-9A-Fa-f]+)\s*\|\s*(.*)$", line.strip())
+            m = re.match(r"^\[#\d+\s+f=(\d+)\s+([A-Z]+)/([A-Z]+)\s+x(\d+)\]\s+fn=(0x[0-9A-Fa-f]+)\((.+?)\)\s+ra=(0x[0-9A-Fa-f]+)\s*\|\s*(.*)$", line.strip())
             if m:
                 key = (m.group(2), m.group(5), m.group(6), m.group(7))
                 anoms[key] = (int(m.group(4)), int(m.group(1)), m.group(8))
