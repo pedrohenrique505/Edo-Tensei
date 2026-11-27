@@ -1,0 +1,90 @@
+From: Edo Tensei <edo-tensei@local>
+Subject: [PATCH] ps2xRuntime: habilitar FTZ/DAZ no MXCSR da VU1 e fallback por prefixHash de 512 bytes
+
+Quando o jogo carrega microprogramas VU1 menores via VIF1 MPG (ex.: 0x0000..0x0360),
+bytes residuais de uploads anteriores permanecem em 0x0360..0x0EA0, mudando o hash
+completo de 16 KiB e causando cache misses no executor nativo VU1 durante a luta.
+Calculamos prefixHash dos primeiros 512 bytes em rebuildDecodedCodeCache como
+fallback de dispatch e habilitamos FTZ+DAZ (0x8040) no MXCSR junto com RTZ (0x6000)
+para flush de denormais em hardware.
+
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -58,6 +58,7 @@ namespace
+         bool currentPairNeedsFlags = true;
+         bool fastMode = false;
+         uint64_t codeHash = 0;
++        uint64_t prefixHash = 0;
+         const void *activeDecodedPairs = nullptr;
+         const uint8_t *activePairFlags = nullptr;
+     };
+@@ -162,6 +163,7 @@ void VU1Interpreter::resetExecutionState()
+     const bool keepFmacFlags = masks.programReadsFmacFlags;
+     const bool keepStatusFlags = masks.programReadsStatusFlags;
+     const uint64_t keepCodeHash = masks.codeHash;
++    const uint64_t keepPrefixHash = masks.prefixHash;
+     const auto *keepDecodedPairs = masks.activeDecodedPairs;
+     const auto *keepPairFlags = masks.activePairFlags;
+     masks = {};
+@@ -169,6 +171,7 @@ void VU1Interpreter::resetExecutionState()
+     masks.programReadsStatusFlags = keepStatusFlags;
+     masks.currentPairNeedsFlags = keepFmacFlags;
+     masks.codeHash = keepCodeHash;
++    masks.prefixHash = keepPrefixHash;
+     masks.activeDecodedPairs = keepDecodedPairs;
+     masks.activePairFlags = keepPairFlags;
+     m_xgkick.sourceAddress = 0;
+@@ -1886,6 +1889,7 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+     const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
+     Vu1ActiveMasks &masks = activeMasksFor(this);
+     const uint64_t codeHash = hashVuCodeBytes(vuCode, codeSize);
++    const uint64_t prefixHash = hashVuCodeBytes(vuCode, std::min<uint32_t>(codeSize, 0x200u));
+ 
+     auto computePairFlags = [&](const DecodedInstructionPair *pairs, uint8_t *pairFlags,
+                                 bool &outReadsFmac, bool &outReadsStatus) {
+@@ -1992,6 +1996,7 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+             masks.programReadsStatusFlags = hit->readsStatusFlags;
+             masks.currentPairNeedsFlags = hit->readsFmacFlags;
+             masks.codeHash = codeHash;
++            masks.prefixHash = prefixHash;
+             masks.activeDecodedPairs = hit->pairs.data();
+             masks.activePairFlags = hit->pairFlags.data();
+             m_cachedVuCode = vuCode;
+@@ -2017,6 +2022,7 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+         masks.programReadsStatusFlags = victim->readsStatusFlags;
+         masks.currentPairNeedsFlags = victim->readsFmacFlags;
+         masks.codeHash = codeHash;
++        masks.prefixHash = prefixHash;
+         masks.activeDecodedPairs = victim->pairs.data();
+         masks.activePairFlags = victim->pairFlags.data();
+         m_cachedVuCode = vuCode;
+@@ -2039,6 +2045,7 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+     masks.programReadsStatusFlags = readsStatusFlags;
+     masks.currentPairNeedsFlags = readsFmacFlags;
+     masks.codeHash = codeHash;
++    masks.prefixHash = prefixHash;
+     masks.activeDecodedPairs = m_decodedCodeCache.data();
+     masks.activePairFlags = s_fallbackFlags.data();
+ 
+@@ -2161,7 +2168,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ 
+ #if defined(__SSE__) || defined(__x86_64__) || defined(_M_X64)
+     const unsigned int previousMxcsr = _mm_getcsr();
+-    _mm_setcsr((previousMxcsr & ~0x6000u) | 0x6000u);
++    _mm_setcsr((previousMxcsr & ~0x6000u) | 0xE040u);
+     auto restoreRounding = [previousMxcsr]() noexcept { _mm_setcsr(previousMxcsr); };
+ #else
+     const int previousRoundingMode = std::fegetround();
+@@ -2212,7 +2219,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     {
+         const bool wantObserve = vuObserve();
+         if (g_vu1NativeExecutor(masks.codeHash, m_state, vuData, dataSize, gs, memory,
+                                 wantObserve ? &vuGifHash : nullptr,
+                                 wantObserve ? &vuGifBytes : nullptr,
++                                vuReplaySink) ||
++            g_vu1NativeExecutor(masks.prefixHash, m_state, vuData, dataSize, gs, memory,
++                                wantObserve ? &vuGifHash : nullptr,
++                                wantObserve ? &vuGifBytes : nullptr,
+                                 vuReplaySink))
+         {
+             restoreRounding();

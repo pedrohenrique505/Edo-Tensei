@@ -179,9 +179,6 @@ def emit_upper(hi: int, lines: list, need_mac: bool) -> bool:
                 bit = 8 >> c
                 lines.append(f"      r{c} = normMac(r{c}, {bit}u, mac);")
             lines.append("      pushMac(mac, cyc + 4u);")
-        else:
-            for c in lanes:
-                lines.append(f"      r{c} = normFast(r{c});")
         if is_acc:
             for c in lanes:
                 lines.append(f"      acc[{c}] = r{c};")
@@ -500,6 +497,16 @@ def emit_lower(pc: int, lo: int, lines: list) -> bool:
         if vit != 0:
             lines.append(f"    vi[{vit}] = (int32_t)(int16_t)((vi[{vis}] - {imm15}) & 0xFFFF);")
         return True
+    if top == 0x15:  # FSSET
+        imm12 = (((lo >> 21) & 1) << 11) | (lo & 0x7FF)
+        lines.append(f"    pushFsset(0x{imm12 & 0xFC0:03X}u, cyc + 4u);")
+        return True
+    if top == 0x16:  # FSAND
+        imm12 = (((lo >> 21) & 1) << 11) | (lo & 0x7FF)
+        lines.append("    commitMac(cyc);")
+        if vit != 0:
+            lines.append(f"    vi[{vit}] = (int32_t)((statusReg & 0xFFFu) & 0x{imm12:03X}u);")
+        return True
     if top == 0x1A:  # FMAND
         lines.append("    commitMac(cyc);")
         if vit != 0:
@@ -508,6 +515,16 @@ def emit_lower(pc: int, lo: int, lines: list) -> bool:
     if top == 0x20:  # B
         tgt = (pc + 8 + im11 * 8) & 0x3FF8
         lines.append(f"    branchPending = true; branchDelay = 1; branchTarget = 0x{tgt:04X}u;")
+        return True
+    if top == 0x21:  # BAL
+        tgt = (pc + 8 + im11 * 8) & 0x3FF8
+        ret_addr = ((pc + 16) // 8) & 0xFFFF
+        if vit != 0:
+            lines.append(f"    vi[{vit}] = {ret_addr};")
+        lines.append(f"    branchPending = true; branchDelay = 1; branchTarget = 0x{tgt:04X}u;")
+        return True
+    if top == 0x24:  # JR
+        lines.append(f"    branchPending = true; branchDelay = 1; branchTarget = ((uint32_t)(uint16_t)readBranchVi({vis}) * 8u) & 0x3FF8u;")
         return True
     if top == 0x28:  # IBEQ
         tgt = (pc + 8 + im11 * 8) & 0x3FF8
@@ -552,6 +569,13 @@ def emit_lower(pc: int, lo: int, lines: list) -> bool:
                         lines.append(f"      float t{c} = vf[{fs}][{c}];")
                     for c in lanes:
                         lines.append(f"      vf[{ft}][{c}] = t{c};")
+                    lines.append("    }")
+                return True
+            if f2 == 0x31:  # MR32
+                if ft != 0 and lanes:
+                    lines.append(f"    {{ float t[4] = {{vf[{fs}][1], vf[{fs}][2], vf[{fs}][3], vf[{fs}][0]}};\n")
+                    for c in lanes:
+                        lines.append(f"      vf[{ft}][{c}] = t[{c}];")
                     lines.append("    }")
                 return True
             if f2 == 0x34:  # LQI
@@ -607,6 +631,10 @@ def emit_lower(pc: int, lo: int, lines: list) -> bool:
                 if vit != 0:
                     lines.append(f"    vi[{vit}] = (int32_t)(st.top & 0x3FFu);")
                 return True
+            if f2 == 0x69:  # XITOP
+                if vit != 0:
+                    lines.append(f"    vi[{vit}] = (int32_t)(st.itop & 0x3FFu);")
+                return True
             if f2 == 0x6C:  # XGKICK
                 lines.append(f"    vu1Xgkick((uint32_t)(uint16_t)vi[{vis}], vuData, dataSize, gs, memory, outGifHash, outGifBytes, replaySink);")
                 return True
@@ -633,6 +661,8 @@ def gen_program(name: str, h64: int, data: bytes) -> str:
     entry_labels = {0}
     has_branch = [False] * len(pairs)
     has_ebit = [False] * len(pairs)
+    has_jr = False
+    jr_extra_targets = set()
     for i, (lo, hi) in enumerate(pairs):
         if lo == 0 and hi == 0:
             if i + 1 < len(pairs) and (pairs[i + 1][0] or pairs[i + 1][1]):
@@ -649,15 +679,48 @@ def gen_program(name: str, h64: int, data: bytes) -> str:
                 tgt = (i * 8 + 8 + imm11(lo) * 8) & 0x3FF8
                 if tgt in valid_pc_set:
                     branch_targets.add(tgt)
+                if i + 2 < len(pairs) and (pairs[i + 2][0] or pairs[i + 2][1]):
+                    jr_extra_targets.add((i + 2) * 8)
             elif top in (0x24, 0x25):
                 has_branch[i] = True
-                branch_targets = set(valid_pcs)
+                has_jr = True
+                if i + 2 < len(pairs) and (pairs[i + 2][0] or pairs[i + 2][1]):
+                    jr_extra_targets.add((i + 2) * 8)
+            elif top == 0x08:  # IADDIU viT, vi0, imm15 -> potential jump target address
+                vis = (lo >> 11) & 0xF
+                if vis == 0:
+                    imm15 = ((lo >> 10) & 0x7800) | (lo & 0x7FF)
+                    tgt = (imm15 * 8) & 0x3FF8
+                    if tgt in valid_pc_set:
+                        jr_extra_targets.add(tgt)
+    if has_jr:
+        branch_targets |= (entry_labels | jr_extra_targets) & valid_pc_set
     all_labels = (entry_labels | branch_targets) & valid_pc_set
     all_labels_sorted = sorted(all_labels)
     branch_targets_sorted = sorted(branch_targets)
 
-    # Check if program has any FMAND
-    has_fmand = any(((hi & 0x80000000) == 0 and ((lo >> 25) & 0x7F) == 0x1A) for lo, hi in pairs)
+    # Compute per-pair need_mac window (only emit normMac/pushMac within 10 pairs of a flag reader,
+    # or across branches targeting a flag-reading window) so hot vertex loops stay branchless & fast.
+    pair_needs_mac = [False] * len(pairs)
+    flag_readers = []
+    for i, (lo, hi) in enumerate(pairs):
+        if (hi & 0x80000000) == 0 and ((lo >> 25) & 0x7F) in (0x14, 0x15, 0x16, 0x17, 0x18, 0x1A, 0x1B):
+            flag_readers.append(i)
+            for k in range(max(0, i - 10), i + 1):
+                pair_needs_mac[k] = True
+    if flag_readers:
+        for i, (lo, hi) in enumerate(pairs):
+            if has_branch[i]:
+                top = (lo >> 25) & 0x7F
+                if top in (0x24, 0x25):
+                    for k in range(max(0, i - 6), min(len(pairs), i + 2)):
+                        pair_needs_mac[k] = True
+                else:
+                    tgt_idx = ((i * 8 + 8 + imm11(lo) * 8) & 0x3FF8) // 8
+                    if tgt_idx < len(pairs) and any(pair_needs_mac[t] for t in range(tgt_idx, min(len(pairs), tgt_idx + 6))):
+                        for k in range(max(0, i - 6), min(len(pairs), i + 2)):
+                            pair_needs_mac[k] = True
+    has_fmand = bool(flag_readers)
 
     out = []
     out.append(f"__attribute__((optimize(\"O1\"))) static bool run_{name}(VU1State &st, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint64_t *outGifHash, uint64_t *outGifBytes, bool replaySink) {{")
@@ -675,21 +738,29 @@ def gen_program(name: str, h64: int, data: bytes) -> str:
     out.append("  std::memcpy(vi, st.vi, sizeof(vi));")
     out.append("  float q = st.q, p = st.p, ireg = st.i;")
     out.append("  uint32_t macReg = st.mac;")
+    out.append("  uint32_t statusReg = st.status;")
     out.append("  uint32_t cyc = 0u;")
     out.append("  uint32_t vfReady[32][4]{};")
     out.append("  bool qPending = false; float qVal = 0.0f; uint32_t qReady = 0u;")
     out.append("  bool pPending = false; float pVal = 0.0f; uint32_t pReady = 0u;")
-    out.append("  struct MacSlot { uint32_t mac; uint32_t ready; bool valid; };")
+    out.append("  struct MacSlot { uint32_t mac; uint32_t status; uint32_t ready; uint32_t issue; bool valid; bool isFsset; bool writesStatus; };")
     out.append("  MacSlot macPipe[8]{}; uint32_t macHead = 0u;")
     out.append("  auto commitMac = [&](uint32_t c) noexcept {")
     out.append("    for (uint32_t k = 0; k < 8u; ++k) {")
     out.append("      uint32_t idx = (macHead + k) & 7u;")
-    out.append("      if (macPipe[idx].valid && macPipe[idx].ready <= c) { macReg = macPipe[idx].mac; macPipe[idx].valid = false; }")
+    out.append("      if (macPipe[idx].valid && macPipe[idx].ready <= c) {")
+    out.append("        if (macPipe[idx].isFsset) { statusReg = (statusReg & 0x3Fu) | macPipe[idx].status; }")
+    out.append("        else { macReg = macPipe[idx].mac; if (macPipe[idx].writesStatus) { uint32_t s = ((macReg & 0xFu) ? 1u : 0u) | ((macReg & 0xF0u) ? 2u : 0u) | ((macReg & 0xF00u) ? 4u : 0u) | ((macReg & 0xF000u) ? 8u : 0u); statusReg = (statusReg & 0xFC0u) | s | (s << 6); } }")
+    out.append("        macPipe[idx].valid = false;")
+    out.append("      }")
     out.append("    }")
     out.append("  };")
     out.append("  auto pushMac = [&](uint32_t m, uint32_t r) noexcept {")
-    out.append("    commitMac(cyc);")
-    out.append("    macPipe[macHead & 7u] = {m, r, true}; ++macHead;")
+    out.append("    macPipe[macHead & 7u] = {m, 0u, r, cyc, true, false, true}; ++macHead;")
+    out.append("  };")
+    out.append("  auto pushFsset = [&](uint32_t s, uint32_t r) noexcept {")
+    out.append("    for (uint32_t k = 0; k < 8u; ++k) { if (macPipe[k].valid && macPipe[k].issue == cyc) macPipe[k].writesStatus = false; }")
+    out.append("    macPipe[macHead & 7u] = {0u, s, r, cyc, true, true, false}; ++macHead;")
     out.append("  };")
     out.append("  bool branchPending = false; int branchDelay = 0; uint32_t branchTarget = 0u;")
     out.append("  bool ebit = false;")
@@ -748,14 +819,15 @@ def gen_program(name: str, h64: int, data: bytes) -> str:
         if vi_w != 0:
             out.append(f"    int32_t oldVi = vi[{vi_w}];")
 
+        need_mac_here = pair_needs_mac[idx]
         if i_bit:
-            if not emit_upper(hi, out, has_fmand):
+            if not emit_upper(hi, out, need_mac_here):
                 raise RuntimeError(f"Unsupported upper op 0x{hi:08X} at pc=0x{pc:04X}")
             fval = struct.unpack("<f", struct.pack("<I", lo))[0]
             out.append(f"    {{ uint32_t ib = 0x{lo:08X}u; std::memcpy(&ireg, &ib, 4); }}")
         elif shadow_reg != 0:
             out.append(f"    float oldVf[4], upVf[4]; std::memcpy(oldVf, vf[{shadow_reg}], 16);")
-            if not emit_upper(hi, out, has_fmand):
+            if not emit_upper(hi, out, need_mac_here):
                 raise RuntimeError(f"Unsupported upper op 0x{hi:08X} at pc=0x{pc:04X}")
             out.append(f"    std::memcpy(upVf, vf[{shadow_reg}], 16); std::memcpy(vf[{shadow_reg}], oldVf, 16);")
             if not emit_lower(pc, lo, out):
@@ -763,7 +835,7 @@ def gen_program(name: str, h64: int, data: bytes) -> str:
             for c in lanes_from_dest(u_wmask):
                 out.append(f"    vf[{shadow_reg}][{c}] = upVf[{c}];")
         else:
-            if not emit_upper(hi, out, has_fmand):
+            if not emit_upper(hi, out, need_mac_here):
                 raise RuntimeError(f"Unsupported upper op 0x{hi:08X} at pc=0x{pc:04X}")
             if not emit_lower(pc, lo, out):
                 raise RuntimeError(f"Unsupported lower op 0x{lo:08X} at pc=0x{pc:04X}")
@@ -783,8 +855,8 @@ def gen_program(name: str, h64: int, data: bytes) -> str:
 
         out.append("    ++cyc;")
         next_pc = (pc + 8) & 0x3FF8
-        may_be_ebit_delay = (idx > 0 and has_ebit[idx - 1]) or (pc in branch_targets)
-        may_be_branch_delay = (idx > 0 and has_branch[idx - 1]) or has_branch[idx] or (pc in branch_targets)
+        may_be_ebit_delay = (idx > 0 and has_ebit[idx - 1])
+        may_be_branch_delay = (idx > 0 and has_branch[idx - 1]) or has_branch[idx]
         if may_be_ebit_delay:
             out.append("    bool wasEbit = ebit;")
             if e_bit:
@@ -805,7 +877,7 @@ def gen_program(name: str, h64: int, data: bytes) -> str:
     out.append("  std::memcpy(st.vf, vf, sizeof(vf));")
     out.append("  std::memcpy(st.acc, acc, sizeof(acc));")
     out.append("  std::memcpy(st.vi, vi, sizeof(vi));")
-    out.append("  st.q = q; st.p = p; st.i = ireg; st.mac = macReg;")
+    out.append("  st.q = q; st.p = p; st.i = ireg; st.mac = macReg; st.status = statusReg;")
     out.append("  st.pc = pc; st.ebit = false; st.branchPending = false;")
     out.append("  st.cycles += cyc;")
     out.append("  return true;")
@@ -816,10 +888,15 @@ def main():
     inputs = sys.argv[1:-1]
     out_path = sys.argv[-1]
     progs = []
+    seen_prefix = set()
     for i, path in enumerate(inputs):
         b = open(path, "rb").read()
         h = hash64(b)
-        progs.append((f"prog_{i}_{h:016x}", h, b))
+        ph = hash64(b[:min(len(b), 0x200)])
+        if ph in seen_prefix:
+            continue
+        seen_prefix.add(ph)
+        progs.append((f"prog_{len(progs)}_{h:016x}", h, ph, b))
 
     header = """// Gerado por tools/gen_vu1_native.py - Executor nativo VU1 para microprogramas quentes.
 #include "runtime/ps2_vu1.h"
@@ -842,13 +919,7 @@ extern void ps2_vu1_register_native_executor(Ps2Vu1NativeFn fn);
 namespace {
 
 inline float normFast(float value) noexcept {
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, 4);
-    const uint32_t exp = (bits >> 23) & 0xFFu;
-    if (exp >= 1u && exp <= 254u) return value;
-    if (exp == 0u) bits &= 0x80000000u;
-    else bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
-    std::memcpy(&value, &bits, 4);
+    // MXCSR FTZ+DAZ (0x8040) is enabled by VU1Interpreter::run() on x86-64.
     return value;
 }
 
@@ -942,12 +1013,15 @@ static void vu1Xgkick(uint32_t qwordAddr, uint8_t *vuData, uint32_t dataSize,
 }
 
 """
-    bodies = [gen_program(name, h, b) for name, h, b in progs]
+    bodies = [gen_program(name, h, b) for name, h, ph, b in progs]
     dispatch = ["static bool edoVu1NativeExecute(uint64_t codeHash, VU1State &st, uint8_t *vuData, uint32_t dataSize,",
                 "                                GS &gs, PS2Memory *memory, uint64_t *outGifHash, uint64_t *outGifBytes, bool replaySink) {",
                 "  switch (codeHash) {"]
-    for name, h, _ in progs:
-        dispatch.append(f"  case 0x{h:016X}ull: return run_{name}(st, vuData, dataSize, gs, memory, outGifHash, outGifBytes, replaySink);")
+    for name, h, ph, _ in progs:
+        dispatch.append(f"  case 0x{h:016X}ull:")
+        if ph != h:
+            dispatch.append(f"  case 0x{ph:016X}ull:")
+        dispatch.append(f"    return run_{name}(st, vuData, dataSize, gs, memory, outGifHash, outGifBytes, replaySink);")
     dispatch.append("  default: return false;")
     dispatch.append("  }")
     dispatch.append("}")
