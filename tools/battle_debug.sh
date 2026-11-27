@@ -34,6 +34,7 @@ Opcoes (replay / run):
   --trace-camera               Registra trace por frame da camera no ring buffer/JSONL
   --trace-fighters             Registra trace por frame de P1/P2 e distancia no ring buffer/JSONL
   --overlay-3d                 Ativa o overlay 3D->2D (P1, P2, alvo da camera) ao abrir
+  --screenshot-on-anomaly      Salva frames PPM em <out-dir>/screenshots na 1a anomalia, erro visual e fim
   --quiet                      Nao ecoa logs do battle-dbg no stderr (grava apenas nos arquivos)
 
 Opcoes (jsonl):
@@ -60,6 +61,7 @@ case "$cmd" in
         trace_cam=0
         trace_fighters=0
         overlay_3d=0
+        screenshot_on_anom=0
         log_stderr=1
 
         while [[ $# -gt 0 ]]; do
@@ -77,6 +79,7 @@ case "$cmd" in
                 --trace-camera) trace_cam=1; shift ;;
                 --trace-fighters) trace_fighters=1; shift ;;
                 --overlay-3d) overlay_3d=1; shift ;;
+                --screenshot-on-anomaly) screenshot_on_anom=1; shift ;;
                 --quiet) log_stderr=0; shift ;;
                 -h|--help) usage; exit 0 ;;
                 *) echo "Opcao desconhecida: $1" >&2; usage >&2; exit 2 ;;
@@ -116,6 +119,12 @@ case "$cmd" in
         else
             unset EDO_BATTLE_SNAPSHOT_FRAME || true
         fi
+        if [[ "$screenshot_on_anom" -eq 1 ]]; then
+            export EDO_BATTLE_SCREENSHOT_DIR="$out_dir/screenshots"
+            rm -rf -- "$out_dir/screenshots"
+        else
+            unset EDO_BATTLE_SCREENSHOT_DIR || true
+        fi
         if [[ -n "$watch_mem" ]]; then
             export EDO_BATTLE_WATCH_MEM="$watch_mem"
         else
@@ -137,6 +146,10 @@ case "$cmd" in
                 echo "[battle-debug] eventos JSONL:      $jsonl_path"
                 if [[ -s "$snapshot_path" ]]; then
                     echo "[battle-debug] snapshot memoria:   $snapshot_path"
+                fi
+                if [[ -d "$out_dir/screenshots" ]]; then
+                    echo "[battle-debug] screenshots:        $out_dir/screenshots"
+                    ls -1 "$out_dir/screenshots" 2>/dev/null | sed 's/^/  - /'
                 fi
             else
                 echo "[battle-debug] AVISO: nenhum report.txt gerado (verifique $log_path)" >&2

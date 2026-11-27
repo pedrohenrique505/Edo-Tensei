@@ -108,6 +108,7 @@ public:
 
     void onGifPacket(const uint8_t *data, uint32_t sizeBytes) override
     {
+        const auto t0 = m_profEnabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::lock_guard<std::recursive_mutex> lock(m_mutex);
         if (!ensureInit())
             return;
@@ -259,6 +260,8 @@ public:
         else if (segStart < sizeBytes)
             m_gpu.gif_transfer(1, data + segStart, sizeBytes - segStart);
         m_stats.gifPackets++;
+        if (m_profEnabled)
+            m_profGifNs.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
     }
 
     void onRegister(uint8_t regAddr, uint64_t value) override
@@ -731,9 +734,54 @@ public:
             m_presentHeight = h;
         }
         m_stats.presentedFrames++;
+        if (m_profEnabled)
+        {
+            static auto lastT = std::chrono::steady_clock::now();
+            static uint64_t lastPres = 0, lastGif = 0;
+            const auto now = std::chrono::steady_clock::now();
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastT).count();
+            if (ms >= 1000)
+            {
+                const uint64_t dp = m_stats.presentedFrames - lastPres;
+                const uint64_t dg = m_stats.gifPackets - lastGif;
+                const uint64_t gifNs = m_profGifNs.exchange(0, std::memory_order_relaxed);
+                std::fprintf(stderr, "[DEBUG-prof:gs] fps=%.1f gif/s=%llu gif_ms=%.1f total_pres=%llu total_gif=%llu\n",
+                             dp * 1000.0 / ms, (unsigned long long)(dg * 1000 / ms),
+                             gifNs / 1e6,
+                             (unsigned long long)m_stats.presentedFrames,
+                             (unsigned long long)m_stats.gifPackets);
+                lastT = now;
+                lastPres = m_stats.presentedFrames;
+                lastGif = m_stats.gifPackets;
+            }
+        }
     }
 
     bool skipCpuRaster() const override { return m_present; }
+
+    bool saveLatestFramePPM(const char *path)
+    {
+        if (!path || !*path)
+            return false;
+        std::vector<uint8_t> rgba;
+        uint32_t w = 0, h = 0;
+        {
+            std::lock_guard<std::mutex> plock(m_presentMutex);
+            if (m_presentFrame.empty() || m_presentWidth == 0 || m_presentHeight == 0)
+                return false;
+            rgba = m_presentFrame;
+            w = m_presentWidth;
+            h = m_presentHeight;
+        }
+        std::FILE *fp = std::fopen(path, "wb");
+        if (!fp)
+            return false;
+        std::fprintf(fp, "P6\n%u %u\n255\n", w, h);
+        for (size_t i = 0; i + 3 < rgba.size(); i += 4)
+            std::fwrite(&rgba[i], 1, 3, fp);
+        std::fclose(fp);
+        return true;
+    }
 
     bool copyPresentationFrame(std::vector<uint8_t> &outPixels, uint32_t &outWidth,
                                uint32_t &outHeight) override
@@ -771,6 +819,8 @@ private:
     GSCpuBackend m_fifoOracle;
     bool m_fifoOracleReady = false;
     bool m_fifoTailLoaded = false;
+    bool m_profEnabled = [] { const char *v = std::getenv("EDO_PROF_MATCH"); return v && *v && *v != '0'; }();
+    std::atomic<uint64_t> m_profGifNs{0};
 };
 ShadowSink *g_sink = nullptr;
 } // namespace
@@ -788,5 +838,10 @@ bool installIfRequested(PS2Runtime &runtime)
     runtime.gs().setGifSink(&sink);
     std::fprintf(stderr, "[dra2-gs] EDO_GS_BACKEND=%s: sink instalado\n", backend);
     return true;
+}
+
+bool saveLatestFramePPM(const char *path)
+{
+    return g_sink ? g_sink->saveLatestFramePPM(path) : false;
 }
 } // namespace edo_parallel_gs

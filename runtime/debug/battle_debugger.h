@@ -231,6 +231,7 @@ public:
     SnapshotForUi captureUiSnapshot() const;
     bool dumpReport(const std::string &path) const;
     bool dumpMemorySnapshot(const uint8_t *rdram, const std::string &path, const char *reason) const;
+    bool saveScreenshot(const char *tag) const;
     const std::string &defaultDumpPath() const { return m_dumpPath; }
     const std::string &defaultSnapshotPath() const { return m_snapshotPath; }
 
@@ -273,9 +274,11 @@ private:
     uint64_t m_maxBattleFrames = 0;
     uint64_t m_snapshotFrame = 0;
     std::atomic<bool> m_snapshotTaken{false};
+    std::atomic<bool> m_visualAnomalyShotTaken{false};
     std::string m_dumpPath;
     std::string m_jsonlPath;
     std::string m_snapshotPath;
+    std::string m_screenshotDir;
     struct WatchRange
     {
         uint32_t addr = 0;

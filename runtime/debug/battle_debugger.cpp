@@ -1,5 +1,8 @@
 #include "battle_debugger.h"
 
+#ifdef EDO_HAS_PARALLEL_GS
+#include "edo_parallel_gs.h"
+#endif
 #include "ps2_recompiled_functions.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -1204,6 +1207,16 @@ void BattleDebugger::initFromEnv()
         m_snapshotPath = ".cache/battle-debug/snapshot.txt";
     }
 
+    if (const char *shotEnv = std::getenv("EDO_BATTLE_SCREENSHOT_DIR"); shotEnv && *shotEnv)
+    {
+        m_screenshotDir = shotEnv;
+    }
+    else
+    {
+        m_screenshotDir.clear();
+    }
+    m_visualAnomalyShotTaken.store(false, std::memory_order_relaxed);
+
     m_watchRanges.clear();
     if (const char *watchEnv = std::getenv("EDO_BATTLE_WATCH_MEM"); watchEnv && *watchEnv)
     {
@@ -1360,6 +1373,8 @@ void BattleDebugger::onBattleFrame(PS2Runtime *runtime)
                 dumpReport(m_dumpPath);
             if (runtime && !m_snapshotPath.empty())
                 dumpMemorySnapshot(runtime->memory().getRDRAM(), m_snapshotPath, stopReason);
+            if (!m_screenshotDir.empty())
+                saveScreenshot("final");
             std::fprintf(stderr, "[battle-dbg] auto-stop (%s) no frame %llu\n",
                          stopReason, static_cast<unsigned long long>(frame));
             std::fflush(stderr);
@@ -1703,6 +1718,19 @@ void BattleDebugger::recordAnomaly(Category cat, Severity sev, uint32_t funcAddr
         dumpReport(m_dumpPath);
     }
 
+    if (!m_screenshotDir.empty())
+    {
+        if (isFirst)
+        {
+            saveScreenshot("first_anomaly");
+        }
+        else if ((cat == Category::Camera || cat == Category::Collision || cat == Category::Matrix) &&
+                 !m_visualAnomalyShotTaken.exchange(true, std::memory_order_relaxed))
+        {
+            saveScreenshot("visual_anomaly");
+        }
+    }
+
     if (m_breakOnAnomaly.load(std::memory_order_relaxed) && sev >= Severity::Error)
     {
         m_paused.store(true, std::memory_order_relaxed);
@@ -1972,6 +2000,30 @@ bool BattleDebugger::dumpMemorySnapshot(const uint8_t *rdram, const std::string 
     return true;
 }
 
+bool BattleDebugger::saveScreenshot(const char *tag) const
+{
+#ifdef EDO_HAS_PARALLEL_GS
+    const std::string dir = m_screenshotDir.empty() ? ".cache/battle-debug/screenshots" : m_screenshotDir;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    char fname[128];
+    std::snprintf(fname, sizeof(fname), "%s_f%llu.ppm",
+                  (tag && *tag) ? tag : "shot",
+                  static_cast<unsigned long long>(m_battleFrame.load(std::memory_order_relaxed)));
+    const std::string fullPath = (std::filesystem::path(dir) / fname).string();
+    const bool ok = edo_parallel_gs::saveLatestFramePPM(fullPath.c_str());
+    if (ok && m_logStderr.load(std::memory_order_relaxed))
+    {
+        std::fprintf(stderr, "[battle-dbg] screenshot salvo: %s\n", fullPath.c_str());
+        std::fflush(stderr);
+    }
+    return ok;
+#else
+    (void)tag;
+    return false;
+#endif
+}
+
 void BattleDebugger::drawUi(PS2Runtime &runtime)
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
@@ -2114,6 +2166,9 @@ void BattleDebugger::drawUi(PS2Runtime &runtime)
         ImGui::SameLine();
         if (ImGui::Button("Dump Snapshot"))
             dumpMemorySnapshot(runtime.memory().getRDRAM(), m_snapshotPath, "ui_button");
+        ImGui::SameLine();
+        if (ImGui::Button("Screenshot"))
+            saveScreenshot("manual");
 
         ImGui::Separator();
         ImGui::Text("BTL: %s | Frame: %llu | Anomalies: %llu (%zu unique) | Math: %llu checks / %llu mismatches",
