@@ -17,6 +17,7 @@ OUT = ROOT / "runtime/overrides/edo_sdk_bindings.inc"
 EXCLUDE = {
     "write",
     "vsprintf",
+    "atan", "cos", "fabs", "floor", "sin",
     "sceTtyWrite", "sceTtyRead", "sceTtyInit", "sceTtyHandler",
     "sceDeci2Open", "sceDeci2ReqSend", "sceDeci2Poll", "sceDeci2ExRecv", "sceDeci2ExSend",
 }

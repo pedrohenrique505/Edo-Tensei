@@ -116,11 +116,8 @@
 {0x0016CC50u, "__ieee754_rem_pio2f"},
 {0x0016E130u, "__kernel_cosf"},
 {0x0016EAE8u, "__kernel_sinf"},
-{0x0016EE78u, "atan"},
-{0x0016F388u, "cos"},
-{0x0016F4B0u, "fabs"},
-{0x0016F4E8u, "floor"},
-{0x0016F970u, "sin"},
+// atan/cos/fabs/floor/sin (double soft-float em $a0/$v0 na EABI64 do R5900) mantidas recompiladas nativamente:
+// ps2_stubs::{atan,cos,fabs,floor,sin} usam float em $f12/$f0 (e setReturnU32 em atan), corrompendo $v0.
 {0x00170328u, "__divdi3"},
 {0x00172DB8u, "sceCdCallback"},
 {0x00172F90u, "sceCdInitEeCB"},
