@@ -11,9 +11,10 @@ Foi projetada com foco **CLI-first** para facilitar o uso por agentes de IA e sc
 | Arquivo | Papel |
 | --- | --- |
 | `runtime/debug/battle_debugger.h` | Estruturas de snapshot (`CameraSnapshot`, `FighterSnapshot`, `AnomalyEvent`, `TraceEvent`) e interface `edo_debug::BattleDebugger` |
-| `runtime/debug/battle_debugger.cpp` | Núcleo de watchdogs, comparador diferencial de matemática, *ring buffer*, escritor JSONL, dumper de memória/structs e painel ImGui (`F2`) + overlay 3D→2D |
+| `runtime/debug/battle_debugger.cpp` | Núcleo de watchdogs, guarda de preempção (`ctx->pc == ra`), mini-callstack, comparador diferencial + modo A/B `--host-math`, *ring buffer*, escritor JSONL, dumper de structs/screenshots e painel ImGui (`F2`) + overlay 3D→2D |
+| `runtime/parallel_gs/edo_parallel_gs.{h,cpp}` | `edo_parallel_gs::saveLatestFramePPM` usado por `--screenshot-on-anomaly` e pelo botão `Screenshot` do painel `F2` |
 | `runtime/overrides/edo_overrides.cpp` | Inicialização (`initFromEnv`, `installCoreHooks`) e ciclo de vida do overlay `BTL` (`onBtlOverlayActivated` / `onBtlOverlayDeactivated`) |
-| `tools/battle_debug.sh` | Interface CLI unificada (`replay`, `run`, `summary`, `top`, `snapshot`, `jsonl`, `diff`) |
+| `tools/battle_debug.sh` | Interface CLI unificada (`replay`, `run`, `summary`, `top`, `snapshot`, `jsonl`, `diff`, `check`) |
 | `patches/ps2recomp/0071-ps2xRuntime-debug-panel-extra-ui-hook.patch` | Hook mínimo via símbolos fracos em `ps2_debug_panel.cpp` para compartilhar o frame `rlImGuiBegin/End` com a janela `F2` |
 
 ---
@@ -21,8 +22,8 @@ Foi projetada com foco **CLI-first** para facilitar o uso por agentes de IA e sc
 ## Fluxo rápido via CLI (recomendado para agentes)
 
 ```bash
-# 1. Capturar uma luta com trace de P1/P2 e encerramento automático após a 1ª anomalia
-tools/battle_debug.sh replay --trace-fighters --stop-after 95 --timeout 85
+# 1. Capturar uma luta com trace de P1/P2, screenshots e auto-stop (25 frames reais após a 1ª anomalia)
+tools/battle_debug.sh replay --trace-fighters --screenshot-on-anomaly --stop-after 25 --timeout 85
 
 # 2. Triagem imediata ranqueada por contagem de ocorrências
 tools/battle_debug.sh top
@@ -35,9 +36,12 @@ tools/battle_debug.sh jsonl --cat CAMERA --limit 30
 tools/battle_debug.sh jsonl --cat COLLISION --limit 30
 tools/battle_debug.sh jsonl --cat MATH --limit 30
 
-# 5. Validar uma correção comparando antes vs. depois
-tools/battle_debug.sh replay --out-dir .cache/battle-debug-depois --stop-after 95 --timeout 85
-tools/battle_debug.sh diff .cache/battle-debug/report.txt .cache/battle-debug-depois/report.txt
+# 5. Isolamento A/B (--host-math) e validação antes vs. depois
+tools/battle_debug.sh replay --host-math --stop-after 25 --timeout 85 --out-dir .cache/battle-debug-host
+tools/battle_debug.sh diff .cache/battle-debug/report.txt .cache/battle-debug-host/report.txt
+
+# 6. Gate de regressão automatizado (retorna exit 0 PASS ou exit 1 FAIL)
+tools/battle_debug.sh check --baseline .cache/battle-debug/report.txt --stop-after 25 --timeout 85
 ```
 
 ---
@@ -48,9 +52,10 @@ tools/battle_debug.sh diff .cache/battle-debug/report.txt .cache/battle-debug-de
 Executa a captura automatizada de Luta Livre (`tools/luta_livre.sh reproduzir`) com o Battle Debugger armado, grava os artefatos no diretório de saída (padrão `.cache/battle-debug/`) e exibe o cabeçalho do `report.txt` ao encerrar.
 
 Artefatos gerados:
-- `report.txt` — resumo geral, `FIRST ANOMALY`, estado atual e último estado bom da câmera, estado de `P1`/`P2`, lista de anomalias únicas deduplicadas e últimos eventos do *ring buffer*.
-- `events.jsonl` — stream JSON Lines (1 objeto JSON por linha, *flushed* imediatamente) contendo anomalias (primeiras 5 ocorrências de cada ponto) e traces ativados.
+- `report.txt` — resumo geral (`battleFrame`, `totalAnomalies`, `mathChecks`, `mathMismatches`, `preemptedSkips`, `hostMathOverrides`), `FIRST ANOMALY`, estado atual e último estado bom da câmera, estado de `P1`/`P2`, lista de anomalias únicas deduplicadas (com `stack=`) e últimos eventos do *ring buffer*.
+- `events.jsonl` — stream JSON Lines (1 objeto JSON por linha, *flushed* imediatamente) contendo anomalias (primeiras 5 ocorrências de cada ponto, incluindo `"stack"`) e traces ativados.
 - `snapshot.txt` — dump em hex (`u32`) + `float` das structs `CAMERA_OBJ`, `FIGHTER_P1`, `FIGHTER_P2` e faixas extras de `--watch`, sinalizando `<<< BAD` em valores corrompidos.
+- `screenshots/` *(quando `--screenshot-on-anomaly` está ativo)* — quadros PPM (`first_anomaly_fN.ppm`, `visual_anomaly_fN.ppm`, `final_fN.ppm`) capturados diretamente do `paraLLEl-GS`.
 - `run.log` — saída completa (`stdout` + `stderr`) do processo.
 
 ### `run [opções]`
@@ -132,7 +137,7 @@ Compara o retorno da função MIPS recompilada contra o equivalente nativo em C+
 - **Inteiro 64 bits:** `__muldi3` (`0x001702B0`), `__divdi3` (`0x00170328`).
 
 ### 4. Painel Interativo ImGui (`F2`) e Overlay 3D→2D
-- **Controles:** `Armed`, `Math Diff`, `Break on Anomaly`, `Trace Cam`, `Trace P1/P2`, `Overlay 3D`, `Pause` / `Resume` / `Step +1`, `Clear`, `Dump Report` e `Dump Snapshot`.
+- **Controles:** `Armed`, `Math Diff`, `Host Math A/B`, `Break on Anomaly`, `Trace Cam`, `Trace P1/P2`, `Overlay 3D`, `Pause` / `Resume` / `Step +1`, `Clear`, `Dump Report`, `Dump Snapshot` e `Screenshot`.
 - **Abas:** `Anomalies` (com filtro por categoria), `Camera` (atual vs. última boa), `Fighters` (P1/P2 e `ViewProj`) e `Trace` (*ring buffer* reverso).
 - **Overlay 3D→2D:** projeta `P1` (ciano), `P2` (laranja), eixo vertical, linha de distância `dist` e alvo da câmera `CAM TGT` (amarelo) diretamente sobre a janela do jogo usando a matriz `ViewProj`.
 
@@ -146,5 +151,5 @@ Compara o retorno da função MIPS recompilada contra o equivalente nativo em C+
 4. **Preempção/continuações:** os hooks verificam `ctx->pc == ra` após o retorno e descartam chamadas interrompidas pelo escalonador EE (contabilizadas em `preemptedSkips`), evitando falsos positivos de retorno parcial. Cada anomalia também registra o mini-callstack dos hooks ativos (`stack`).
 5. **Cobertura de colisão:** os watchdogs de colisão atuais cobrem posições, deltas, limites de arena, distância `P1↔P2` e primitivas `dist2D_XY`/`dist3D_XYZ`. Volumes individuais de golpe/hurtbox (`ccBgAttackHit`, `ccWireHitModel`) e malhas triangulares de cenário ainda não estão mapeados nem desenhados no overlay 3D→2D.
 6. **Limites de retenção em memória:** o *ring buffer* guarda até `256` eventos de trace e `128` pontos únicos de anomalia por sessão; no `events.jsonl`, cada ponto único `(cat, fn, ra)` grava no máximo as primeiras `5` ocorrências para evitar arquivos gigantes em bugs a 60 FPS.
-7. **Dependência do overlay visual:** o painel `F2` e o overlay 3D→2D requerem build com `PS2X_ENABLE_DEBUG_UI=ON` (padrão atual em `build/`). O modo CLI (`report.txt`, `events.jsonl`, `snapshot.txt`) funciona independentemente da UI.
+7. **Dependência do overlay visual e screenshots:** o painel `F2` e o overlay 3D→2D requerem build com `PS2X_ENABLE_DEBUG_UI=ON` (padrão atual em `build/`). A captura de screenshots (`--screenshot-on-anomaly`) requer `EDO_ENABLE_PARALLEL_GS=ON` com `EDO_GS_BACKEND=gpu-present` ou `gpu-shadow`. O modo CLI (`report.txt`, `events.jsonl`, `snapshot.txt`) funciona independentemente da UI.
 8. **Armadilha de rebuild:** ao estender o debugger, edite `runtime/debug/battle_debugger.{h,cpp}` (rebuild em ~8–15s). Evite criar novos `.cpp` em `runtime/debug/` sem necessidade (aciona regeração do CMake de ~3,5 min por causa de `CONFIGURE_DEPENDS`) e **nunca** edite `ps2_runtime_macros.h` ou `ps2_runtime.h` para probes (invalida o PCH e dispara rebuild de ~38 min).

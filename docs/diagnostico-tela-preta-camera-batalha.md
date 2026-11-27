@@ -148,3 +148,17 @@ Na primeira chamada de `debugCam_170208` (ou em um teste unitário/hook rápido)
 - `runtime/overrides/edo_overrides.cpp` — apenas hooks temporários `DEBUG-cam`
 - `runtime/parallel_gs/edo_parallel_gs.cpp` — apenas probes temporários `DEBUG-prof:gs`
 - `external/PS2Recomp/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp` — patches `0067`/`0068` + probes temporários `DEBUG-prof`/`DEBUG-cam`
+
+---
+
+## Atualização (Battle Debugger + Isolamento A/B)
+
+Os hooks temporários `[DEBUG-cam]` em `runtime/overrides/edo_overrides.cpp` foram substituídos pelo **Battle Debugger** permanente ([`docs/battle-debugger.md`](battle-debugger.md), `tools/battle_debug.sh`).
+
+A verificação diferencial (`974.865` checagens matemáticas em 25 frames reais de batalha, com guarda de preempção `ctx->pc == ra`, `preemptedSkips=93`) estreitou ainda mais o alvo:
+
+- **Íntegros (0 divergências):** `__adddf3`, `__subdf3`, `__muldf3`, `__divdf3`, `__extendsfdf2`, `__muldi3`, `__divdi3`, `sinf`, `cosf`, `tanf`, `atanf` e `atan2f`.
+- **Únicos focos reais de divergência:**
+  1. `0x0016EE78` (`atan(double)`) — `ra=0x0016B4D8` (`stack=atan2 -> atan`)
+  2. `0x00170208` (`atan2(double)`) — `ra=0x0010C4F4` (sinal invertido) e `ra=0x006E9A54` (`stack=ovl_btl_cam_update -> ovl_btl_cam_apply_shake -> atan2`)
+- **Confirmação A/B (`tools/battle_debug.sh replay --host-math`):** ao substituir os retornos divergentes pelo valor IEEE-754 do host, os pontos `atan2` da câmera (`ra=0x006E9A54`, `18x -> 0`) e `__truncdfsf2(nan -> inf)` (`ra=0x0010C500`, `662x -> 0`) desapareceram completamente.
