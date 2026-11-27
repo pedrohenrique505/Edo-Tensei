@@ -4,6 +4,7 @@
 // como fazem os stubs gerados pelo ps2_recomp.
 
 #include "game_overrides.h"
+#include "battle_debugger.h"
 #ifdef EDO_HAS_PARALLEL_GS
 #include "edo_parallel_gs.h"
 #endif
@@ -452,6 +453,7 @@ namespace
         {
             if (activeId == 1u)
             {
+                edo_debug::BattleDebugger::instance().onBtlOverlayDeactivated(*runtime);
                 runtime->replaceFunction(0x00726550u, nullptr);
             }
             for (size_t i = 0; i < activeCount; ++i)
@@ -472,6 +474,7 @@ namespace
             if (overlayId == 1u)
             {
                 runtime->registerFunction(0x00726550u, &ovlBtlFunc00726550);
+                edo_debug::BattleDebugger::instance().onBtlOverlayActivated(*runtime);
             }
             activeEntries = nextEntries;
             activeCount = nextCount;
@@ -698,6 +701,8 @@ namespace
             FUN_001007d0_0x1007d0(r, c, rt);
         });
         runtime.replaceFunction(0x0019FEC0u, updateNodeWorldMatrix_0019fec0);
+        edo_debug::BattleDebugger::instance().initFromEnv();
+        edo_debug::BattleDebugger::instance().installCoreHooks(runtime);
         runtime.replaceFunction(0x003D5700u, ratioClamp1f_003d5700);
         runtime.replaceFunction(0x0015F068u, ttyWrite);
         runtime.replaceFunction(0x00162808u, sifBindRpcBlocking);

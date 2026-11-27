@@ -166,6 +166,9 @@ public:
     bool isBreakOnAnomaly() const { return m_breakOnAnomaly.load(std::memory_order_relaxed); }
     void setBreakOnAnomaly(bool v) { m_breakOnAnomaly.store(v, std::memory_order_relaxed); }
 
+    bool isTraceCamera() const { return m_traceCamera.load(std::memory_order_relaxed); }
+    void setTraceCamera(bool v) { m_traceCamera.store(v, std::memory_order_relaxed); }
+
     bool isPaused() const { return m_paused.load(std::memory_order_relaxed); }
     void setPaused(bool v) { m_paused.store(v, std::memory_order_relaxed); }
     void requestStepFrame() { m_stepRequests.fetch_add(1, std::memory_order_relaxed); }
@@ -185,9 +188,16 @@ public:
     bool dumpReport(const std::string &path) const;
     const std::string &defaultDumpPath() const { return m_dumpPath; }
 
+    void drawUi(PS2Runtime &runtime);
+    bool isUiVisible() const { return m_uiVisible; }
+    void toggleUiVisible() { m_uiVisible = !m_uiVisible; }
+
 private:
     BattleDebugger() = default;
     ~BattleDebugger();
+
+    void writeJsonlAnomalyLocked(const AnomalyEvent &ev, bool isFirst);
+    void writeJsonlTraceLocked(const TraceEvent &ev);
 
     static constexpr size_t kMaxAnomalies = 128;
     static constexpr size_t kMaxTraces = 256;
@@ -196,16 +206,22 @@ private:
     std::atomic<bool> m_btlActive{false};
     std::atomic<bool> m_mathCheckEnabled{true};
     std::atomic<bool> m_breakOnAnomaly{false};
+    std::atomic<bool> m_traceCamera{false};
     std::atomic<bool> m_logStderr{true};
     std::atomic<bool> m_paused{false};
+    std::atomic<bool> m_autoStopTriggered{false};
     std::atomic<uint32_t> m_stepRequests{0};
     std::atomic<uint64_t> m_battleFrame{0};
     std::atomic<uint64_t> m_totalAnomalies{0};
     std::atomic<uint64_t> m_mathChecks{0};
     std::atomic<uint64_t> m_mathMismatches{0};
 
+    uint64_t m_stopAfterAnomalyFrames = 0;
+    uint64_t m_maxBattleFrames = 0;
     std::string m_dumpPath;
+    std::string m_jsonlPath;
     bool m_autoDumpOnExit = false;
+    bool m_uiVisible = false;
 
     mutable std::mutex m_mutex;
     uint64_t m_seq = 0;
@@ -216,6 +232,7 @@ private:
     std::deque<AnomalyEvent> m_anomalies;
     std::unordered_map<uint64_t, size_t> m_dedupIndex;
     std::deque<TraceEvent> m_traces;
+    std::FILE *m_jsonlFile = nullptr;
 };
 
 } // namespace edo_debug
