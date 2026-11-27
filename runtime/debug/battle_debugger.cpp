@@ -606,6 +606,250 @@ void hookAtan2f_00170280(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     }
 }
 
+void hookCosf_0016fd78(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    auto &dbg = BattleDebugger::instance();
+    const bool check = dbg.isEnabled() && dbg.isBtlActive() && dbg.isMathCheckEnabled() &&
+                       ctx->pc == 0x0016FD78u;
+    const float x = check ? ctx->f[12] : 0.0f;
+    const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+
+    FUN_0016fd78_0x16fd78(rdram, ctx, runtime);
+
+    if (check)
+    {
+        const float guest = ctx->f[0];
+        const float host = std::cos(x);
+        const bool mismatch = floatDiverges(guest, host);
+        dbg.countMathCheck(mismatch);
+        if (mismatch)
+        {
+            dbg.recordAnomaly(
+                Category::Math, Severity::Error, 0x0016FD78u, ra, "cosf",
+                "x=%.6g[0x%08X] -> guest=%.6g[0x%08X] host=%.6g[0x%08X]",
+                x, floatBits(x), guest, floatBits(guest), host, floatBits(host));
+        }
+    }
+}
+
+void hookMuldi3_001702b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    auto &dbg = BattleDebugger::instance();
+    const bool check = dbg.isEnabled() && dbg.isBtlActive() && dbg.isMathCheckEnabled() &&
+                       ctx->pc == 0x001702B0u;
+    const uint64_t a = check ? GPR_U64(ctx, 4) : 0;
+    const uint64_t b = check ? GPR_U64(ctx, 5) : 0;
+    const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+
+    FUN_001702b0_0x1702b0(rdram, ctx, runtime);
+
+    if (check)
+    {
+        const uint64_t guest = GPR_U64(ctx, 2);
+        const uint64_t host = a * b;
+        const bool mismatch = (guest != host);
+        dbg.countMathCheck(mismatch);
+        if (mismatch)
+        {
+            dbg.recordAnomaly(
+                Category::Math, Severity::Critical, 0x001702B0u, ra, "__muldi3",
+                "a=0x%016llX b=0x%016llX -> guest=0x%016llX host=0x%016llX",
+                static_cast<unsigned long long>(a), static_cast<unsigned long long>(b),
+                static_cast<unsigned long long>(guest), static_cast<unsigned long long>(host));
+        }
+    }
+}
+
+void hookDivdi3_00170328(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    auto &dbg = BattleDebugger::instance();
+    const bool check = dbg.isEnabled() && dbg.isBtlActive() && dbg.isMathCheckEnabled() &&
+                       ctx->pc == 0x00170328u;
+    const int64_t a = check ? static_cast<int64_t>(GPR_U64(ctx, 4)) : 0;
+    const int64_t b = check ? static_cast<int64_t>(GPR_U64(ctx, 5)) : 0;
+    const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+
+    FUN_00170328_0x170328(rdram, ctx, runtime);
+
+    if (check && b != 0)
+    {
+        const int64_t guest = static_cast<int64_t>(GPR_U64(ctx, 2));
+        const int64_t host = a / b;
+        const bool mismatch = (guest != host);
+        dbg.countMathCheck(mismatch);
+        if (mismatch)
+        {
+            dbg.recordAnomaly(
+                Category::Math, Severity::Critical, 0x00170328u, ra, "__divdi3",
+                "a=%lld[0x%016llX] b=%lld[0x%016llX] -> guest=%lld[0x%016llX] host=%lld[0x%016llX]",
+                static_cast<long long>(a), static_cast<unsigned long long>(a),
+                static_cast<long long>(b), static_cast<unsigned long long>(b),
+                static_cast<long long>(guest), static_cast<unsigned long long>(guest),
+                static_cast<long long>(host), static_cast<unsigned long long>(host));
+        }
+    }
+}
+
+void hookExtendsfdf2_00172108(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    auto &dbg = BattleDebugger::instance();
+    const bool check = dbg.isEnabled() && dbg.isBtlActive() && dbg.isMathCheckEnabled() &&
+                       ctx->pc == 0x00172108u;
+    const float f = check ? ctx->f[12] : 0.0f;
+    const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+
+    FUN_00172108_0x172108(rdram, ctx, runtime);
+
+    if (check)
+    {
+        const uint64_t rawRes = GPR_U64(ctx, 2);
+        double guest = 0.0;
+        std::memcpy(&guest, &rawRes, 8);
+        const double host = static_cast<double>(f);
+        const bool mismatch = doubleDiverges(guest, host, 1e-6, 1e-5);
+        dbg.countMathCheck(mismatch);
+        if (mismatch)
+        {
+            dbg.recordAnomaly(
+                Category::Math, Severity::Critical, 0x00172108u, ra, "__extendsfdf2",
+                "f=%.6g[0x%08X] -> guest=%.6g[0x%016llX] host=%.6g[0x%016llX]",
+                f, floatBits(f),
+                guest, static_cast<unsigned long long>(rawRes),
+                host, static_cast<unsigned long long>(doubleBits(host)));
+        }
+    }
+}
+
+void hookTruncdfsf2_00172cc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    auto &dbg = BattleDebugger::instance();
+    const bool check = dbg.isEnabled() && dbg.isBtlActive() && dbg.isMathCheckEnabled() &&
+                       ctx->pc == 0x00172CC0u;
+    const uint64_t rawD = check ? GPR_U64(ctx, 4) : 0;
+    const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+
+    FUN_00172cc0_0x172cc0(rdram, ctx, runtime);
+
+    if (check)
+    {
+        double d = 0.0;
+        std::memcpy(&d, &rawD, 8);
+        const float guest = ctx->f[0];
+        const float host = static_cast<float>(d);
+        const bool mismatch = floatDiverges(guest, host, 1e-4f, 1e-3f);
+        dbg.countMathCheck(mismatch);
+        if (mismatch)
+        {
+            dbg.recordAnomaly(
+                Category::Math, Severity::Critical, 0x00172CC0u, ra, "__truncdfsf2",
+                "d=%.6g[0x%016llX] -> guest=%.6g[0x%08X] host=%.6g[0x%08X]",
+                d, static_cast<unsigned long long>(rawD),
+                guest, floatBits(guest), host, floatBits(host));
+        }
+    }
+}
+
+void hookDist2D_001814a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    auto &dbg = BattleDebugger::instance();
+    const bool check = dbg.isEnabled() && dbg.isBtlActive() && ctx->pc == 0x001814A0u;
+    const uint32_t p1Addr = check ? getRegU32(ctx, 4) : 0;
+    const uint32_t p2Addr = check ? getRegU32(ctx, 5) : 0;
+    const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+
+    FUN_001814a0_0x1814a0(rdram, ctx, runtime);
+
+    if (check)
+    {
+        const float d = ctx->f[0];
+        if (isBadFloat(d))
+        {
+            float p1[4]{}, p2[4]{};
+            if (const uint8_t *p = getConstMemPtr(rdram, p1Addr)) std::memcpy(p1, p, 16);
+            if (const uint8_t *p = getConstMemPtr(rdram, p2Addr)) std::memcpy(p2, p, 16);
+            dbg.recordAnomaly(
+                Category::Collision, Severity::Critical, 0x001814A0u, ra, "dist2D_XY",
+                "p1=(%.3g,%.3g,%.3g) p2=(%.3g,%.3g,%.3g) -> d=%.4g[0x%08X]",
+                p1[0], p1[1], p1[2], p2[0], p2[1], p2[2], d, floatBits(d));
+        }
+    }
+}
+
+void hookDist3D_00181510(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    auto &dbg = BattleDebugger::instance();
+    const bool check = dbg.isEnabled() && dbg.isBtlActive() && ctx->pc == 0x00181510u;
+    const uint32_t p1Addr = check ? getRegU32(ctx, 4) : 0;
+    const uint32_t p2Addr = check ? getRegU32(ctx, 5) : 0;
+    const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+
+    FUN_00181510_0x181510(rdram, ctx, runtime);
+
+    if (check)
+    {
+        const float d = ctx->f[0];
+        if (isBadFloat(d))
+        {
+            float p1[4]{}, p2[4]{};
+            if (const uint8_t *p = getConstMemPtr(rdram, p1Addr)) std::memcpy(p1, p, 16);
+            if (const uint8_t *p = getConstMemPtr(rdram, p2Addr)) std::memcpy(p2, p, 16);
+            dbg.recordAnomaly(
+                Category::Collision, Severity::Critical, 0x00181510u, ra, "dist3D_XYZ",
+                "p1=(%.3g,%.3g,%.3g) p2=(%.3g,%.3g,%.3g) -> d=%.4g[0x%08X]",
+                p1[0], p1[1], p1[2], p2[0], p2[1], p2[2], d, floatBits(d));
+        }
+    }
+}
+
+void hookQuatToMat_00181e80(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    auto &dbg = BattleDebugger::instance();
+    const bool check = dbg.isEnabled() && dbg.isBtlActive() && ctx->pc == 0x00181E80u;
+    const uint32_t mAddr = check ? getRegU32(ctx, 4) : 0;
+    const uint32_t qAddr = check ? getRegU32(ctx, 5) : 0;
+    const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+
+    FUN_00181e80_0x181e80(rdram, ctx, runtime);
+
+    if (check)
+    {
+        float m[16]{};
+        if (const uint8_t *p = getConstMemPtr(rdram, mAddr)) std::memcpy(m, p, 64);
+        if (isBadMat4(m))
+        {
+            float q[4]{};
+            if (const uint8_t *p = getConstMemPtr(rdram, qAddr)) std::memcpy(q, p, 16);
+            dbg.recordAnomaly(
+                Category::Matrix, Severity::Error, 0x00181E80u, ra, "quatToMat",
+                "q=(%.4g,%.4g,%.4g,%.4g) -> m0=(%.4g,%.4g,%.4g)",
+                q[0], q[1], q[2], q[3], m[0], m[1], m[2]);
+        }
+    }
+}
+
+void hookMatToQuat_00181fc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    auto &dbg = BattleDebugger::instance();
+    const bool check = dbg.isEnabled() && dbg.isBtlActive() && ctx->pc == 0x00181FC0u;
+    const uint32_t qAddr = check ? getRegU32(ctx, 4) : 0;
+    const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+
+    FUN_00181fc0_0x181fc0(rdram, ctx, runtime);
+
+    if (check)
+    {
+        float q[4]{};
+        if (const uint8_t *p = getConstMemPtr(rdram, qAddr)) std::memcpy(q, p, 16);
+        if (isBadVec3(q) || isBadFloat(q[3]))
+        {
+            dbg.recordAnomaly(
+                Category::Matrix, Severity::Error, 0x00181FC0u, ra, "matToQuat",
+                "q=(%.4g[0x%08X],%.4g,%.4g,%.4g)",
+                q[0], floatBits(q[0]), q[1], q[2], q[3]);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BTL Overlay Camera Hooks
 // ---------------------------------------------------------------------------
@@ -837,9 +1081,18 @@ void BattleDebugger::installCoreHooks(PS2Runtime &runtime)
     runtime.replaceFunction(0x00172888u, &hookDivdf3_00172888);
     runtime.replaceFunction(0x00172600u, &hookMuldf3_00172600);
     runtime.replaceFunction(0x001700A8u, &hookSinf_001700a8);
+    runtime.replaceFunction(0x0016FD78u, &hookCosf_0016fd78);
     runtime.replaceFunction(0x00170190u, &hookTanf_00170190);
     runtime.replaceFunction(0x0016FAA8u, &hookAtanf_0016faa8);
     runtime.replaceFunction(0x00170280u, &hookAtan2f_00170280);
+    runtime.replaceFunction(0x001702B0u, &hookMuldi3_001702b0);
+    runtime.replaceFunction(0x00170328u, &hookDivdi3_00170328);
+    runtime.replaceFunction(0x00172108u, &hookExtendsfdf2_00172108);
+    runtime.replaceFunction(0x00172CC0u, &hookTruncdfsf2_00172cc0);
+    runtime.replaceFunction(0x001814A0u, &hookDist2D_001814a0);
+    runtime.replaceFunction(0x00181510u, &hookDist3D_00181510);
+    runtime.replaceFunction(0x00181E80u, &hookQuatToMat_00181e80);
+    runtime.replaceFunction(0x00181FC0u, &hookMatToQuat_00181fc0);
 }
 
 void BattleDebugger::onBtlOverlayActivated(PS2Runtime &runtime)
