@@ -81,14 +81,19 @@ target_precompile_headers(edo_generated PRIVATE
 # Executável
 # ---------------------------------------------------------------------------
 file(GLOB EDO_OVERRIDE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/overrides/*.cpp")
+file(GLOB EDO_DEBUG_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/debug/*.cpp")
 
 add_executable(edo-tensei
     "${RT_DIR}/src/main.cpp"
     "${EDO_GENERATED_DIR}/register_functions.cpp"
     ${EDO_OVERRIDE_SOURCES}
+    ${EDO_DEBUG_SOURCES}
 )
 target_link_libraries(edo-tensei PRIVATE ps2_runtime edo_generated)
-target_include_directories(edo-tensei PRIVATE "${RT_DIR}/src/lib")
+target_include_directories(edo-tensei PRIVATE
+    "${RT_DIR}/src/lib"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/debug"
+)
 
 # Construtores estáticos C++ (.ctors em 0x005E3A00..0x005E6840), gerados separadamente
 # para não precisar recompilar edo_generated inteiro.
