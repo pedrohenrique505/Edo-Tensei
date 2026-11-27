@@ -86,6 +86,7 @@ struct AnomalyEvent
     uint32_t occurrences = 1;
     std::string funcName;
     std::string detail;
+    std::string callstack;
 };
 
 struct TraceEvent
@@ -109,6 +110,7 @@ struct SnapshotForUi
     uint64_t totalAnomalies = 0;
     uint64_t mathChecks = 0;
     uint64_t mathMismatches = 0;
+    uint64_t preemptedSkips = 0;
     CameraSnapshot currentCam;
     CameraSnapshot lastGoodCam;
     bool hasLastGoodCam = false;
@@ -213,6 +215,7 @@ public:
     void updateFightersSnapshot(uint32_t camCtxAddr, const FighterSnapshot fighters[2]);
     void updateViewProjMatrix(const float vp[16], bool valid);
     void countMathCheck(bool mismatch);
+    void countPreemptedSkip() { m_preemptedSkips.fetch_add(1, std::memory_order_relaxed); }
 
     void recordTrace(Category cat, uint32_t funcAddr, uint32_t callerRa, const char *fmt, ...);
     void recordAnomaly(Category cat, Severity sev, uint32_t funcAddr, uint32_t callerRa,
@@ -256,6 +259,7 @@ private:
     std::atomic<uint64_t> m_totalAnomalies{0};
     std::atomic<uint64_t> m_mathChecks{0};
     std::atomic<uint64_t> m_mathMismatches{0};
+    std::atomic<uint64_t> m_preemptedSkips{0};
 
     uint64_t m_stopAfterAnomalyFrames = 0;
     uint64_t m_maxBattleFrames = 0;

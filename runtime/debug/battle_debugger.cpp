@@ -167,6 +167,62 @@ bool isBtlAddress(uint32_t addr)
     return addr >= 0x006C6D00u && addr < 0x00A00000u;
 }
 
+struct HookFrame
+{
+    uint32_t funcAddr = 0;
+    const char *funcName = nullptr;
+};
+
+constexpr size_t kMaxHookStack = 16;
+thread_local HookFrame t_hookStack[kMaxHookStack]{};
+thread_local size_t t_hookDepth = 0;
+
+struct HookScope
+{
+    bool pushed = false;
+    HookScope(bool active, uint32_t funcAddr, const char *funcName)
+    {
+        if (active && t_hookDepth < kMaxHookStack)
+        {
+            t_hookStack[t_hookDepth++] = HookFrame{funcAddr, funcName};
+            pushed = true;
+        }
+    }
+    ~HookScope()
+    {
+        if (pushed && t_hookDepth > 0)
+            --t_hookDepth;
+    }
+};
+
+std::string formatActiveCallstack()
+{
+    if (t_hookDepth == 0)
+        return {};
+    std::string out;
+    for (size_t i = 0; i < t_hookDepth; ++i)
+    {
+        if (i > 0)
+            out += " -> ";
+        if (t_hookStack[i].funcName && *t_hookStack[i].funcName)
+        {
+            out += t_hookStack[i].funcName;
+        }
+        else
+        {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "0x%08X", t_hookStack[i].funcAddr);
+            out += buf;
+        }
+    }
+    return out;
+}
+
+bool didReturnNormally(const R5900Context *ctx, uint32_t expectedRa)
+{
+    return ctx && ctx->pc == expectedRa;
+}
+
 // ---------------------------------------------------------------------------
 // Core & Math Hooks (Main ELF)
 // ---------------------------------------------------------------------------
@@ -177,11 +233,17 @@ void hookRenderCamera_0010e430(uint8_t *rdram, R5900Context *ctx, PS2Runtime *ru
     const bool check = dbg.isEnabled() && dbg.isBtlActive() && ctx->pc == 0x0010E430u;
     const uint32_t renderCam = check ? getRegU32(ctx, 4) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x0010E430u, "FUN_0010e430");
 
     FUN_0010e430_0x10e430(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra))
+        {
+            dbg.countPreemptedSkip();
+            return;
+        }
         float vp[16]{};
         if (const uint8_t *p = getConstMemPtr(rdram, renderCam + 0xC0u))
             std::memcpy(vp, p, sizeof(vp));
@@ -201,7 +263,9 @@ void hookRenderCamera_0010e430(uint8_t *rdram, R5900Context *ctx, PS2Runtime *ru
 void hookCameraLookAt_0019f990(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     auto &dbg = BattleDebugger::instance();
-    if (dbg.isEnabled() && dbg.isBtlActive() && ctx->pc == 0x0019F990u)
+    const bool check = dbg.isEnabled() && dbg.isBtlActive() && ctx->pc == 0x0019F990u;
+    HookScope scope(check, 0x0019F990u, "CameraLookAt");
+    if (check)
     {
         const uint32_t a0 = getRegU32(ctx, 4);
         const uint32_t a1 = getRegU32(ctx, 5);
@@ -249,11 +313,13 @@ void hookRotMatrixZ_00153170(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runt
     const uint32_t a0 = check ? getRegU32(ctx, 4) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
     const float theta = check ? ctx->f[12] : 0.0f;
+    HookScope scope(check, 0x00153170u, "sceVu0RotMatrixZ");
 
     FUN_00153170_0x153170(rdram, ctx, runtime);
 
     if (check && isBtlAddress(ra))
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         float m[16]{};
         if (const uint8_t *p = getConstMemPtr(rdram, a0))
             std::memcpy(m, p, 64);
@@ -275,11 +341,13 @@ void hookApplyMatrix_00152da8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
     const uint32_t a1 = check ? getRegU32(ctx, 5) : 0;
     const uint32_t a2 = check ? getRegU32(ctx, 6) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00152DA8u, "sceVu0ApplyMatrix");
 
     FUN_00152da8_0x152da8(rdram, ctx, runtime);
 
     if (check && isBtlAddress(ra))
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         float out[4]{}, in[4]{}, m[16]{};
         if (const uint8_t *p = getConstMemPtr(rdram, a0))
             std::memcpy(out, p, 16);
@@ -307,11 +375,13 @@ void hookAtan2_00170208(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const uint64_t rawY = check ? GPR_U64(ctx, 4) : 0;
     const uint64_t rawX = check ? GPR_U64(ctx, 5) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00170208u, "atan2");
 
     FUN_00170208_0x170208(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const uint64_t rawRes = GPR_U64(ctx, 2);
         double y = 0.0, x = 0.0, guest = 0.0;
         std::memcpy(&y, &rawY, 8);
@@ -340,11 +410,13 @@ void hookAtan_0016ee78(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
                        ctx->pc == 0x0016EE78u;
     const uint64_t rawX = check ? GPR_U64(ctx, 4) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x0016EE78u, "atan");
 
     FUN_0016ee78_0x16ee78(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const uint64_t rawRes = GPR_U64(ctx, 2);
         double x = 0.0, guest = 0.0;
         std::memcpy(&x, &rawX, 8);
@@ -372,11 +444,13 @@ void hookDivdf3_00172888(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const uint64_t rawA = check ? GPR_U64(ctx, 4) : 0;
     const uint64_t rawB = check ? GPR_U64(ctx, 5) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00172888u, "__divdf3");
 
     FUN_00172888_0x172888(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const uint64_t rawRes = GPR_U64(ctx, 2);
         double a = 0.0, b = 0.0, guest = 0.0;
         std::memcpy(&a, &rawA, 8);
@@ -406,11 +480,13 @@ void hookMuldf3_00172600(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const uint64_t rawA = check ? GPR_U64(ctx, 4) : 0;
     const uint64_t rawB = check ? GPR_U64(ctx, 5) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00172600u, "__muldf3");
 
     FUN_00172600_0x172600(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const uint64_t rawRes = GPR_U64(ctx, 2);
         double a = 0.0, b = 0.0, guest = 0.0;
         std::memcpy(&a, &rawA, 8);
@@ -440,11 +516,13 @@ void hookAdddf3_00172540(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const uint64_t rawA = check ? GPR_U64(ctx, 4) : 0;
     const uint64_t rawB = check ? GPR_U64(ctx, 5) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00172540u, "__adddf3");
 
     FUN_00172540_0x172540(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const uint64_t rawRes = GPR_U64(ctx, 2);
         double a = 0.0, b = 0.0, guest = 0.0;
         std::memcpy(&a, &rawA, 8);
@@ -474,11 +552,13 @@ void hookSubdf3_00172598(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const uint64_t rawA = check ? GPR_U64(ctx, 4) : 0;
     const uint64_t rawB = check ? GPR_U64(ctx, 5) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00172598u, "__subdf3");
 
     FUN_00172598_0x172598(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const uint64_t rawRes = GPR_U64(ctx, 2);
         double a = 0.0, b = 0.0, guest = 0.0;
         std::memcpy(&a, &rawA, 8);
@@ -507,11 +587,13 @@ void hookSinf_001700a8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
                        ctx->pc == 0x001700A8u;
     const float x = check ? ctx->f[12] : 0.0f;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x001700A8u, "sinf");
 
     FUN_001700a8_0x1700a8(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const float guest = ctx->f[0];
         const float host = std::sin(x);
         const bool mismatch = floatDiverges(guest, host);
@@ -533,11 +615,13 @@ void hookTanf_00170190(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
                        ctx->pc == 0x00170190u;
     const float x = check ? ctx->f[12] : 0.0f;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00170190u, "tanf");
 
     FUN_00170190_0x170190(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const float guest = ctx->f[0];
         const float host = std::tan(x);
         const bool mismatch = floatDiverges(guest, host);
@@ -559,11 +643,13 @@ void hookAtanf_0016faa8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
                        ctx->pc == 0x0016FAA8u;
     const float x = check ? ctx->f[12] : 0.0f;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x0016FAA8u, "atanf");
 
     FUN_0016faa8_0x16faa8(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const float guest = ctx->f[0];
         const float host = std::atan(x);
         const bool mismatch = floatDiverges(guest, host);
@@ -586,11 +672,13 @@ void hookAtan2f_00170280(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const float y = check ? ctx->f[12] : 0.0f;
     const float x = check ? ctx->f[13] : 0.0f;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00170280u, "atan2f");
 
     FUN_00170280_0x170280(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const float guest = ctx->f[0];
         const float host = std::atan2(y, x);
         const bool mismatch = floatDiverges(guest, host);
@@ -613,11 +701,13 @@ void hookCosf_0016fd78(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
                        ctx->pc == 0x0016FD78u;
     const float x = check ? ctx->f[12] : 0.0f;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x0016FD78u, "cosf");
 
     FUN_0016fd78_0x16fd78(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const float guest = ctx->f[0];
         const float host = std::cos(x);
         const bool mismatch = floatDiverges(guest, host);
@@ -640,11 +730,13 @@ void hookMuldi3_001702b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const uint64_t a = check ? GPR_U64(ctx, 4) : 0;
     const uint64_t b = check ? GPR_U64(ctx, 5) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x001702B0u, "__muldi3");
 
     FUN_001702b0_0x1702b0(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const uint64_t guest = GPR_U64(ctx, 2);
         const uint64_t host = a * b;
         const bool mismatch = (guest != host);
@@ -668,11 +760,13 @@ void hookDivdi3_00170328(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const int64_t a = check ? static_cast<int64_t>(GPR_U64(ctx, 4)) : 0;
     const int64_t b = check ? static_cast<int64_t>(GPR_U64(ctx, 5)) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00170328u, "__divdi3");
 
     FUN_00170328_0x170328(rdram, ctx, runtime);
 
     if (check && b != 0)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const int64_t guest = static_cast<int64_t>(GPR_U64(ctx, 2));
         const int64_t host = a / b;
         const bool mismatch = (guest != host);
@@ -697,11 +791,13 @@ void hookExtendsfdf2_00172108(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
                        ctx->pc == 0x00172108u;
     const float f = check ? ctx->f[12] : 0.0f;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00172108u, "__extendsfdf2");
 
     FUN_00172108_0x172108(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const uint64_t rawRes = GPR_U64(ctx, 2);
         double guest = 0.0;
         std::memcpy(&guest, &rawRes, 8);
@@ -727,11 +823,13 @@ void hookTruncdfsf2_00172cc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runt
                        ctx->pc == 0x00172CC0u;
     const uint64_t rawD = check ? GPR_U64(ctx, 4) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00172CC0u, "__truncdfsf2");
 
     FUN_00172cc0_0x172cc0(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         double d = 0.0;
         std::memcpy(&d, &rawD, 8);
         const float guest = ctx->f[0];
@@ -756,11 +854,13 @@ void hookDist2D_001814a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const uint32_t p1Addr = check ? getRegU32(ctx, 4) : 0;
     const uint32_t p2Addr = check ? getRegU32(ctx, 5) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x001814A0u, "dist2D_XY");
 
     FUN_001814a0_0x1814a0(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const float d = ctx->f[0];
         if (isBadFloat(d))
         {
@@ -782,11 +882,13 @@ void hookDist3D_00181510(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     const uint32_t p1Addr = check ? getRegU32(ctx, 4) : 0;
     const uint32_t p2Addr = check ? getRegU32(ctx, 5) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00181510u, "dist3D_XYZ");
 
     FUN_00181510_0x181510(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         const float d = ctx->f[0];
         if (isBadFloat(d))
         {
@@ -808,11 +910,13 @@ void hookQuatToMat_00181e80(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runti
     const uint32_t mAddr = check ? getRegU32(ctx, 4) : 0;
     const uint32_t qAddr = check ? getRegU32(ctx, 5) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00181E80u, "quatToMat");
 
     FUN_00181e80_0x181e80(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         float m[16]{};
         if (const uint8_t *p = getConstMemPtr(rdram, mAddr)) std::memcpy(m, p, 64);
         if (isBadMat4(m))
@@ -833,11 +937,13 @@ void hookMatToQuat_00181fc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runti
     const bool check = dbg.isEnabled() && dbg.isBtlActive() && ctx->pc == 0x00181FC0u;
     const uint32_t qAddr = check ? getRegU32(ctx, 4) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x00181FC0u, "matToQuat");
 
     FUN_00181fc0_0x181fc0(rdram, ctx, runtime);
 
     if (check)
     {
+        if (!didReturnNormally(ctx, ra)) { dbg.countPreemptedSkip(); return; }
         float q[4]{};
         if (const uint8_t *p = getConstMemPtr(rdram, qAddr)) std::memcpy(q, p, 16);
         if (isBadVec3(q) || isBadFloat(q[3]))
@@ -858,14 +964,28 @@ void hookBtlCameraUpdate_006e95f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime 
 {
     auto &dbg = BattleDebugger::instance();
     const bool isEntry = (ctx->pc == 0x006E95F0u);
-    if (isEntry)
+    const uint32_t s2 = isEntry ? getRegU32(ctx, 4) : 0;
+    const uint32_t ra = isEntry ? getRegU32(ctx, 31) : 0;
+
+    // Count battleFrame 1:1 on the primary battle camera (the one holding P1/P2 pointers at +0x20/+0x24).
+    bool isPrimaryCam = false;
+    if (isEntry && s2 != 0u)
+    {
+        if (const uint8_t *p = getConstMemPtr(rdram, s2))
+        {
+            uint32_t p1 = 0, p2 = 0;
+            std::memcpy(&p1, p + 0x20, 4);
+            std::memcpy(&p2, p + 0x24, 4);
+            isPrimaryCam = (p1 != 0u || p2 != 0u);
+        }
+    }
+    if (isPrimaryCam)
     {
         dbg.onBattleFrame(runtime);
     }
 
     const bool check = isEntry && dbg.isEnabled();
-    const uint32_t s2 = check ? getRegU32(ctx, 4) : 0;
-    const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x006E95F0u, "ovl_btl_cam_update");
     float beforePos[3]{}, beforeTgt[3]{};
     if (check)
     {
@@ -959,6 +1079,7 @@ void hookBtlCameraShake_006e99f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     const bool check = dbg.isEnabled() && ctx->pc == 0x006E99F0u;
     const uint32_t s0 = check ? getRegU32(ctx, 4) : 0;
     const uint32_t ra = check ? getRegU32(ctx, 31) : 0;
+    HookScope scope(check, 0x006E99F0u, "ovl_btl_cam_apply_shake");
     float b30[3]{}, b80[3]{};
     if (check)
     {
@@ -1254,7 +1375,7 @@ void BattleDebugger::updateFightersSnapshot(uint32_t camCtxAddr, const FighterSn
                 continue;
 
             const bool hadPrev = prev.present && prev.addr == updated[i].addr &&
-                                 frame > m_actors.battleFrame && (frame - m_actors.battleFrame) <= 8 &&
+                                 frame > m_actors.battleFrame && (frame - m_actors.battleFrame) <= 2 &&
                                  !isBadVec3(prev.pos);
             if (hadPrev)
                 std::memcpy(updated[i].prevPos, prev.pos, sizeof(updated[i].prevPos));
@@ -1378,7 +1499,7 @@ void BattleDebugger::writeJsonlAnomalyLocked(const AnomalyEvent &ev, bool isFirs
     std::fprintf(m_jsonlFile,
                  "{\"type\":\"anomaly\",\"seq\":%llu,\"frame\":%llu,\"cat\":\"%s\",\"sev\":\"%s\","
                  "\"fn\":\"0x%08X\",\"fn_name\":\"%s\",\"ra\":\"0x%08X\",\"count\":%u,"
-                 "\"first\":%s,\"detail\":\"%s\"}\n",
+                 "\"first\":%s,\"stack\":\"%s\",\"detail\":\"%s\"}\n",
                  static_cast<unsigned long long>(ev.seq),
                  static_cast<unsigned long long>(ev.battleFrame),
                  categoryName(ev.category),
@@ -1388,6 +1509,7 @@ void BattleDebugger::writeJsonlAnomalyLocked(const AnomalyEvent &ev, bool isFirs
                  ev.callerRa,
                  ev.occurrences,
                  isFirst ? "true" : "false",
+                 jsonEscape(ev.callstack).c_str(),
                  jsonEscape(ev.detail).c_str());
     std::fflush(m_jsonlFile);
 }
@@ -1446,6 +1568,7 @@ void BattleDebugger::recordAnomaly(Category cat, Severity sev, uint32_t funcAddr
     va_end(args);
 
     const uint64_t frame = m_battleFrame.load(std::memory_order_relaxed);
+    const std::string activeStack = formatActiveCallstack();
     m_totalAnomalies.fetch_add(1, std::memory_order_relaxed);
 
     bool shouldPrint = false;
@@ -1485,6 +1608,7 @@ void BattleDebugger::recordAnomaly(Category cat, Severity sev, uint32_t funcAddr
             ev.occurrences = 1;
             ev.funcName = funcName ? funcName : "";
             ev.detail = detail;
+            ev.callstack = activeStack;
 
             if (!m_firstAnomaly.has_value())
             {
@@ -1554,6 +1678,7 @@ void BattleDebugger::clear()
     m_totalAnomalies.store(0, std::memory_order_relaxed);
     m_mathChecks.store(0, std::memory_order_relaxed);
     m_mathMismatches.store(0, std::memory_order_relaxed);
+    m_preemptedSkips.store(0, std::memory_order_relaxed);
 }
 
 SnapshotForUi BattleDebugger::captureUiSnapshot() const
@@ -1568,6 +1693,7 @@ SnapshotForUi BattleDebugger::captureUiSnapshot() const
     out.totalAnomalies = m_totalAnomalies.load(std::memory_order_relaxed);
     out.mathChecks = m_mathChecks.load(std::memory_order_relaxed);
     out.mathMismatches = m_mathMismatches.load(std::memory_order_relaxed);
+    out.preemptedSkips = m_preemptedSkips.load(std::memory_order_relaxed);
 
     std::lock_guard<std::mutex> lock(m_mutex);
     out.currentCam = m_currentCam;
@@ -1601,7 +1727,8 @@ bool BattleDebugger::dumpReport(const std::string &path) const
       << " btlActive=" << (snap.btlActive ? 1 : 0)
       << " totalAnomalies=" << snap.totalAnomalies
       << " mathChecks=" << snap.mathChecks
-      << " mathMismatches=" << snap.mathMismatches << "\n\n";
+      << " mathMismatches=" << snap.mathMismatches
+      << " preemptedSkips=" << snap.preemptedSkips << "\n\n";
 
     if (snap.firstAnomaly.has_value())
     {
@@ -1612,7 +1739,10 @@ bool BattleDebugger::dumpReport(const std::string &path) const
                       categoryName(a.category), severityName(a.severity),
                       static_cast<unsigned long long>(a.battleFrame),
                       a.funcAddr, a.funcName.c_str(), a.callerRa);
-        f << hdr << "  " << a.detail << "\n\n";
+        f << hdr << "  " << a.detail << "\n";
+        if (!a.callstack.empty())
+            f << "  stack: " << a.callstack << "\n";
+        f << "\n";
     }
     else
     {
@@ -1669,12 +1799,14 @@ bool BattleDebugger::dumpReport(const std::string &path) const
     {
         char line[512];
         std::snprintf(line, sizeof(line),
-                      "[#%llu f=%llu %s/%s x%u] fn=0x%08X(%s) ra=0x%08X | %s\n",
+                      "[#%llu f=%llu %s/%s x%u] fn=0x%08X(%s) ra=0x%08X | %s%s%s\n",
                       static_cast<unsigned long long>(a.seq),
                       static_cast<unsigned long long>(a.battleFrame),
                       categoryName(a.category), severityName(a.severity),
                       a.occurrences, a.funcAddr, a.funcName.c_str(), a.callerRa,
-                      a.detail.c_str());
+                      a.detail.c_str(),
+                      a.callstack.empty() ? "" : " | stack=",
+                      a.callstack.c_str());
         f << line;
     }
 
