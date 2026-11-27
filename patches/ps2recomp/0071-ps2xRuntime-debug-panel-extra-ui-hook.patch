@@ -1,0 +1,47 @@
+diff --git i/ps2xRuntime/src/lib/ps2_debug_panel.cpp w/ps2xRuntime/src/lib/ps2_debug_panel.cpp
+index c9aa2c6..cbe49ce 100644
+--- i/ps2xRuntime/src/lib/ps2_debug_panel.cpp
++++ w/ps2xRuntime/src/lib/ps2_debug_panel.cpp
+@@ -2198,6 +2198,11 @@ void PS2DebugPanel::shutdown()
+ #endif
+ }
+ 
++#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
++extern "C" bool ps2xDebugUiHasExtraOverlay() __attribute__((weak));
++extern "C" void ps2xDebugUiDrawExtraOverlay(PS2Runtime &runtime) __attribute__((weak));
++#endif
++
+ void PS2DebugPanel::draw(PS2Runtime &runtime)
+ {
+ #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+@@ -2211,13 +2216,16 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
+         toggleVisible();
+     }
+ 
+-    if (!m_visible)
++    const bool extraVisible = ps2xDebugUiHasExtraOverlay ? ps2xDebugUiHasExtraOverlay() : false;
++    if (!m_visible && !extraVisible)
+     {
+         return;
+     }
+ 
+     rlImGuiBegin();
+ 
++    if (m_visible)
++    {
+     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
+     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
+     {
+@@ -2302,6 +2310,12 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
+         }
+     }
+     ImGui::End();
++    }
++
++    if (extraVisible && ps2xDebugUiDrawExtraOverlay)
++    {
++        ps2xDebugUiDrawExtraOverlay(runtime);
++    }
+ 
+     rlImGuiEnd();
+ #else

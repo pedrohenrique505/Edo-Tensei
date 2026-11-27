@@ -13,6 +13,11 @@
 #include <fstream>
 #include <thread>
 
+#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+#include "imgui.h"
+#include "raylib.h"
+#endif
+
 #ifdef EDO_HAS_OVL_BTL
 extern void ovl_btl_FUN_006e95f0_0x6e95f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 extern void ovl_btl_FUN_006e99f0_0x6e99f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -983,7 +988,215 @@ bool BattleDebugger::dumpReport(const std::string &path) const
 
 void BattleDebugger::drawUi(PS2Runtime & /*runtime*/)
 {
-    // Implemented in Commit 3 (ImGui panel)
+#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+    if (!m_uiVisible)
+        return;
+
+    const SnapshotForUi snap = captureUiSnapshot();
+
+    ImGui::SetNextWindowSize(ImVec2(820.0f, 560.0f), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Battle Debugger [F2]", &m_uiVisible))
+    {
+        bool enabled = snap.enabled;
+        if (ImGui::Checkbox("Armed", &enabled))
+            setEnabled(enabled);
+        ImGui::SameLine();
+
+        bool mathCheck = snap.mathCheckEnabled;
+        if (ImGui::Checkbox("Math Diff", &mathCheck))
+            setMathCheckEnabled(mathCheck);
+        ImGui::SameLine();
+
+        bool breakAnom = snap.breakOnAnomaly;
+        if (ImGui::Checkbox("Break on Anomaly", &breakAnom))
+            setBreakOnAnomaly(breakAnom);
+        ImGui::SameLine();
+
+        bool traceCam = isTraceCamera();
+        if (ImGui::Checkbox("Trace Cam", &traceCam))
+            setTraceCamera(traceCam);
+
+        ImGui::SameLine();
+        if (snap.paused)
+        {
+            if (ImGui::Button("Resume"))
+                setPaused(false);
+            ImGui::SameLine();
+            if (ImGui::Button("Step +1"))
+                requestStepFrame();
+        }
+        else
+        {
+            if (ImGui::Button("Pause"))
+                setPaused(true);
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Clear"))
+            clear();
+        ImGui::SameLine();
+        if (ImGui::Button("Dump Report"))
+            dumpReport(m_dumpPath);
+
+        ImGui::Separator();
+        ImGui::Text("BTL: %s | Frame: %llu | Anomalies: %llu (%zu unique) | Math: %llu checks / %llu mismatches",
+                    snap.btlActive ? "ACTIVE" : "inactive",
+                    static_cast<unsigned long long>(snap.battleFrame),
+                    static_cast<unsigned long long>(snap.totalAnomalies),
+                    snap.anomalies.size(),
+                    static_cast<unsigned long long>(snap.mathChecks),
+                    static_cast<unsigned long long>(snap.mathMismatches));
+
+        if (snap.firstAnomaly.has_value())
+        {
+            const auto &fa = *snap.firstAnomaly;
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
+            ImGui::TextWrapped("FIRST ANOMALY [f=%llu %s/%s] fn=0x%08X(%s) ra=0x%08X: %s",
+                               static_cast<unsigned long long>(fa.battleFrame),
+                               categoryName(fa.category), severityName(fa.severity),
+                               fa.funcAddr, fa.funcName.c_str(), fa.callerRa, fa.detail.c_str());
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Separator();
+        if (ImGui::BeginTabBar("battle-dbg-tabs"))
+        {
+            if (ImGui::BeginTabItem("Anomalies"))
+            {
+                static int catFilter = -1;
+                if (ImGui::RadioButton("All", catFilter == -1)) catFilter = -1;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Camera", catFilter == 0)) catFilter = 0;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Math", catFilter == 1)) catFilter = 1;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Matrix", catFilter == 2)) catFilter = 2;
+                ImGui::SameLine();
+                if (ImGui::RadioButton("Collision", catFilter == 3)) catFilter = 3;
+
+                if (ImGui::BeginTable("btl_anomalies", 7,
+                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                          ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY,
+                                      ImVec2(0, 320)))
+                {
+                    ImGui::TableSetupColumn("Frame", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+                    ImGui::TableSetupColumn("Cat", ImGuiTableColumnFlags_WidthFixed, 68.0f);
+                    ImGui::TableSetupColumn("Sev", ImGuiTableColumnFlags_WidthFixed, 45.0f);
+                    ImGui::TableSetupColumn("Count", ImGuiTableColumnFlags_WidthFixed, 48.0f);
+                    ImGui::TableSetupColumn("Function", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+                    ImGui::TableSetupColumn("Caller $ra", ImGuiTableColumnFlags_WidthFixed, 82.0f);
+                    ImGui::TableSetupColumn("Detail");
+                    ImGui::TableHeadersRow();
+
+                    for (const auto &a : snap.anomalies)
+                    {
+                        if (catFilter >= 0 && static_cast<int>(a.category) != catFilter)
+                            continue;
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::Text("%llu", static_cast<unsigned long long>(a.battleFrame));
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextUnformatted(categoryName(a.category));
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::TextUnformatted(severityName(a.severity));
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::Text("%u", a.occurrences);
+                        ImGui::TableSetColumnIndex(4);
+                        ImGui::Text("0x%08X %s", a.funcAddr, a.funcName.c_str());
+                        ImGui::TableSetColumnIndex(5);
+                        ImGui::Text("0x%08X", a.callerRa);
+                        ImGui::TableSetColumnIndex(6);
+                        ImGui::TextUnformatted(a.detail.c_str());
+                    }
+                    ImGui::EndTable();
+                }
+                ImGui::EndTabItem();
+            }
+
+            if (ImGui::BeginTabItem("Camera"))
+            {
+                auto drawCam = [](const char *title, const CameraSnapshot &c) {
+                    ImGui::Text("%s (f=%llu obj=0x%08X status=%s%s)",
+                                title, static_cast<unsigned long long>(c.battleFrame),
+                                c.camObjAddr, c.valid ? "OK" : "CORRUPT",
+                                c.reason.empty() ? "" : (" [" + c.reason + "]").c_str());
+                    ImGui::Text("  pos   = (%.4g [0x%08X], %.4g [0x%08X], %.4g [0x%08X])",
+                                c.pos[0], floatBits(c.pos[0]),
+                                c.pos[1], floatBits(c.pos[1]),
+                                c.pos[2], floatBits(c.pos[2]));
+                    ImGui::Text("  tgt   = (%.4g [0x%08X], %.4g [0x%08X], %.4g [0x%08X])",
+                                c.tgt[0], floatBits(c.tgt[0]),
+                                c.tgt[1], floatBits(c.tgt[1]),
+                                c.tgt[2], floatBits(c.tgt[2]));
+                    ImGui::Text("  shake = (%.4g, %.4g, %.4g, %.4g) | distSq = %.4g",
+                                c.shake[0], c.shake[1], c.shake[2], c.shake[3], c.distSq);
+                };
+                drawCam("Current Camera", snap.currentCam);
+                ImGui::Separator();
+                if (snap.hasLastGoodCam)
+                    drawCam("Last Good Camera", snap.lastGoodCam);
+                else
+                    ImGui::TextUnformatted("Last Good Camera: (none yet)");
+                ImGui::EndTabItem();
+            }
+
+            if (ImGui::BeginTabItem("Trace"))
+            {
+                if (ImGui::BeginTable("btl_traces", 5,
+                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                          ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY,
+                                      ImVec2(0, 320)))
+                {
+                    ImGui::TableSetupColumn("Seq", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+                    ImGui::TableSetupColumn("Frame", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+                    ImGui::TableSetupColumn("Cat", ImGuiTableColumnFlags_WidthFixed, 68.0f);
+                    ImGui::TableSetupColumn("Fn / $ra", ImGuiTableColumnFlags_WidthFixed, 160.0f);
+                    ImGui::TableSetupColumn("Summary");
+                    ImGui::TableHeadersRow();
+
+                    for (auto it = snap.traces.rbegin(); it != snap.traces.rend(); ++it)
+                    {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::Text("%llu", static_cast<unsigned long long>(it->seq));
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::Text("%llu", static_cast<unsigned long long>(it->battleFrame));
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::TextUnformatted(categoryName(it->category));
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::Text("0x%08X / 0x%08X", it->funcAddr, it->callerRa);
+                        ImGui::TableSetColumnIndex(4);
+                        ImGui::TextUnformatted(it->summary.c_str());
+                    }
+                    ImGui::EndTable();
+                }
+                ImGui::EndTabItem();
+            }
+
+            ImGui::EndTabBar();
+        }
+    }
+    ImGui::End();
+#endif
 }
 
 } // namespace edo_debug
+
+#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
+extern "C" bool ps2xDebugUiHasExtraOverlay()
+{
+    auto &dbg = edo_debug::BattleDebugger::instance();
+    if (IsKeyPressed(KEY_F2))
+    {
+        dbg.toggleUiVisible();
+        if (dbg.isUiVisible() && !dbg.isEnabled())
+            dbg.setEnabled(true);
+    }
+    return dbg.isUiVisible();
+}
+
+extern "C" void ps2xDebugUiDrawExtraOverlay(PS2Runtime &runtime)
+{
+    edo_debug::BattleDebugger::instance().drawUi(runtime);
+}
+#endif
