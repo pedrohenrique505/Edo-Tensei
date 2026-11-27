@@ -1,0 +1,21 @@
+From: Edo Tensei <edo-tensei@local>
+Subject: [PATCH] ps2xRuntime: respeitar delaysNextBranchRead no loop rapido VU1
+
+O loop rapido de VU1Interpreter::run gravava m_viBranchBackupValid para
+qualquer escrita em VI (viWriteMask != 0), inclusive instrucoes cujo resultado
+deve ser visivel imediatamente no branch seguinte (FMAND, FSAND, ILW, XTOP,
+XITOP). Nos microprogramas de batalha (ex: 76548714fc26fb7a, f0eacbc321ec9dfc),
+FMAND/FSAND seguido de IBNE/IBEQ lia o valor antigo de VI, quebrando culling e
+shading dos personagens (cabecas/bracos/pernas pretos).
+
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -2311,7 +2311,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             }
+ 
+             m_viBranchBackupValid = false;
+-            if (viWriteMask != 0u)
++            if (viWriteMask != 0u && decoded.lowerUsage.delaysNextBranchRead)
+             {
+                 m_viBranchBackupReg = writtenVi;
+                 m_viBranchBackupValue = oldVi;
