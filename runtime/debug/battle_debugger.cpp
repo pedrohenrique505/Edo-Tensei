@@ -947,6 +947,7 @@ void hookBtlCameraUpdate_006e95f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime 
             if (fighters[0].present || fighters[1].present)
             {
                 dbg.updateFightersSnapshot(s2, fighters);
+                dbg.maybeAutoSnapshot(rdram);
             }
         }
     }
@@ -1028,7 +1029,50 @@ void BattleDebugger::initFromEnv()
     m_logStderr.store(envFlagEnabled("EDO_BATTLE_STDERR", true), std::memory_order_relaxed);
     m_stopAfterAnomalyFrames = envU64("EDO_BATTLE_STOP_AFTER", 0);
     m_maxBattleFrames = envU64("EDO_BATTLE_MAX_FRAMES", 0);
+    m_snapshotFrame = envU64("EDO_BATTLE_SNAPSHOT_FRAME", 0);
+    m_snapshotTaken.store(false, std::memory_order_relaxed);
     m_uiVisible = enabled && envFlagEnabled("EDO_BATTLE_UI", false);
+
+    if (const char *snapEnv = std::getenv("EDO_BATTLE_SNAPSHOT"); snapEnv && *snapEnv)
+    {
+        m_snapshotPath = snapEnv;
+    }
+    else
+    {
+        m_snapshotPath = ".cache/battle-debug/snapshot.txt";
+    }
+
+    m_watchRanges.clear();
+    if (const char *watchEnv = std::getenv("EDO_BATTLE_WATCH_MEM"); watchEnv && *watchEnv)
+    {
+        const char *p = watchEnv;
+        while (*p)
+        {
+            while (*p == ',' || *p == ' ' || *p == ';')
+                ++p;
+            if (!*p)
+                break;
+            char *end1 = nullptr;
+            const unsigned long addr = std::strtoul(p, &end1, 0);
+            if (end1 == p)
+                break;
+            uint32_t size = 0x40u;
+            if (*end1 == ':')
+            {
+                char *end2 = nullptr;
+                const unsigned long sz = std::strtoul(end1 + 1, &end2, 0);
+                if (end2 > end1 + 1 && sz > 0)
+                    size = static_cast<uint32_t>(std::min<unsigned long>(sz, 0x1000u));
+                p = end2;
+            }
+            else
+            {
+                p = end1;
+            }
+            if (addr != 0)
+                m_watchRanges.push_back(WatchRange{static_cast<uint32_t>(addr), size});
+        }
+    }
 
     if (const char *dumpEnv = std::getenv("EDO_BATTLE_DUMP"); dumpEnv && *dumpEnv)
     {
@@ -1152,6 +1196,8 @@ void BattleDebugger::onBattleFrame(PS2Runtime *runtime)
         {
             if (!m_dumpPath.empty())
                 dumpReport(m_dumpPath);
+            if (runtime && !m_snapshotPath.empty())
+                dumpMemorySnapshot(runtime->memory().getRDRAM(), m_snapshotPath, stopReason);
             std::fprintf(stderr, "[battle-dbg] auto-stop (%s) no frame %llu\n",
                          stopReason, static_cast<unsigned long long>(frame));
             std::fflush(stderr);
@@ -1648,7 +1694,108 @@ bool BattleDebugger::dumpReport(const std::string &path) const
     return true;
 }
 
-void BattleDebugger::drawUi(PS2Runtime & /*runtime*/)
+void BattleDebugger::maybeAutoSnapshot(const uint8_t *rdram)
+{
+    if (!rdram || !isEnabled() || m_snapshotPath.empty())
+        return;
+    if (m_snapshotTaken.load(std::memory_order_relaxed))
+        return;
+
+    const uint64_t frame = m_battleFrame.load(std::memory_order_relaxed);
+    const char *reason = nullptr;
+    if (m_snapshotFrame > 0 && frame >= m_snapshotFrame)
+    {
+        reason = "target_frame";
+    }
+    else if (m_snapshotFrame == 0 && m_totalAnomalies.load(std::memory_order_relaxed) > 0)
+    {
+        reason = "first_anomaly_with_actors";
+    }
+
+    if (reason && !m_snapshotTaken.exchange(true, std::memory_order_relaxed))
+    {
+        dumpMemorySnapshot(rdram, m_snapshotPath, reason);
+    }
+}
+
+bool BattleDebugger::dumpMemorySnapshot(const uint8_t *rdram, const std::string &path, const char *reason) const
+{
+    if (!rdram || path.empty())
+        return false;
+
+    const SnapshotForUi snap = captureUiSnapshot();
+    std::error_code ec;
+    const std::filesystem::path p(path);
+    if (p.has_parent_path())
+        std::filesystem::create_directories(p.parent_path(), ec);
+
+    std::ofstream f(path, std::ios::out | std::ios::trunc);
+    if (!f)
+        return false;
+
+    f << "=== Edo-Tensei Battle Memory Snapshot ===\n";
+    f << "reason=" << (reason ? reason : "manual")
+      << " battleFrame=" << snap.battleFrame
+      << " camObj=0x" << std::hex << snap.actors.camCtxAddr
+      << " P1=0x" << snap.actors.fighters[0].addr
+      << " P2=0x" << snap.actors.fighters[1].addr << std::dec << "\n\n";
+
+    auto dumpBlock = [&](const char *title, uint32_t baseAddr, uint32_t offset, uint32_t size) {
+        if (baseAddr == 0 || size == 0)
+            return;
+        const uint32_t startAddr = baseAddr + offset;
+        const uint8_t *mem = getConstMemPtr(rdram, startAddr);
+        if (!mem)
+            return;
+        char hdr[160];
+        std::snprintf(hdr, sizeof(hdr), "--- %s [0x%08X + 0x%X .. +0x%X] ---\n",
+                      title, baseAddr, offset, offset + size);
+        f << hdr;
+        for (uint32_t off = 0; off + 16 <= size; off += 16)
+        {
+            uint32_t u[4]{};
+            float fl[4]{};
+            std::memcpy(u, mem + off, 16);
+            std::memcpy(fl, mem + off, 16);
+            const bool anyBad = isBadFloat(fl[0]) || isBadFloat(fl[1]) ||
+                                isBadFloat(fl[2]) || isBadFloat(fl[3]);
+            char line[256];
+            std::snprintf(line, sizeof(line),
+                          "  +0x%03X (0x%08X): %08X %08X %08X %08X | f=(%9.4g, %9.4g, %9.4g, %9.4g)%s\n",
+                          offset + off, startAddr + off,
+                          u[0], u[1], u[2], u[3],
+                          fl[0], fl[1], fl[2], fl[3],
+                          anyBad ? "  <<< BAD" : "");
+            f << line;
+        }
+        f << "\n";
+    };
+
+    if (snap.actors.camCtxAddr)
+        dumpBlock("CAMERA_OBJ", snap.actors.camCtxAddr, 0x00, 0x160);
+
+    for (int i = 0; i < 2; ++i)
+    {
+        if (!snap.actors.fighters[i].present)
+            continue;
+        const char *tag = (i == 0) ? "FIGHTER_P1" : "FIGHTER_P2";
+        const uint32_t addr = snap.actors.fighters[i].addr;
+        dumpBlock(tag, addr, 0x000, 0x100);
+        dumpBlock(tag, addr, 0x2C0, 0x040);
+        dumpBlock(tag, addr, 0x9E0, 0x020);
+    }
+
+    for (size_t i = 0; i < m_watchRanges.size(); ++i)
+    {
+        char tag[32];
+        std::snprintf(tag, sizeof(tag), "WATCH_%zu", i);
+        dumpBlock(tag, m_watchRanges[i].addr, 0, m_watchRanges[i].size);
+    }
+
+    return true;
+}
+
+void BattleDebugger::drawUi(PS2Runtime &runtime)
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     const bool drawOverlay = m_overlay3dEnabled.load(std::memory_order_relaxed);
@@ -1782,6 +1929,9 @@ void BattleDebugger::drawUi(PS2Runtime & /*runtime*/)
         ImGui::SameLine();
         if (ImGui::Button("Dump Report"))
             dumpReport(m_dumpPath);
+        ImGui::SameLine();
+        if (ImGui::Button("Dump Snapshot"))
+            dumpMemorySnapshot(runtime.memory().getRDRAM(), m_snapshotPath, "ui_button");
 
         ImGui::Separator();
         ImGui::Text("BTL: %s | Frame: %llu | Anomalies: %llu (%zu unique) | Math: %llu checks / %llu mismatches",

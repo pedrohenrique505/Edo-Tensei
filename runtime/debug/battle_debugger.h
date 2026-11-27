@@ -221,7 +221,11 @@ public:
     void clear();
     SnapshotForUi captureUiSnapshot() const;
     bool dumpReport(const std::string &path) const;
+    bool dumpMemorySnapshot(const uint8_t *rdram, const std::string &path, const char *reason) const;
     const std::string &defaultDumpPath() const { return m_dumpPath; }
+    const std::string &defaultSnapshotPath() const { return m_snapshotPath; }
+
+    void maybeAutoSnapshot(const uint8_t *rdram);
 
     void drawUi(PS2Runtime &runtime);
     bool isUiVisible() const { return m_uiVisible; }
@@ -255,8 +259,17 @@ private:
 
     uint64_t m_stopAfterAnomalyFrames = 0;
     uint64_t m_maxBattleFrames = 0;
+    uint64_t m_snapshotFrame = 0;
+    std::atomic<bool> m_snapshotTaken{false};
     std::string m_dumpPath;
     std::string m_jsonlPath;
+    std::string m_snapshotPath;
+    struct WatchRange
+    {
+        uint32_t addr = 0;
+        uint32_t size = 0;
+    };
+    std::vector<WatchRange> m_watchRanges;
     bool m_autoDumpOnExit = false;
     bool m_uiVisible = false;
 
